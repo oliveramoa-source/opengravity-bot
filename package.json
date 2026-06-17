@@ -1,0 +1,24 @@
+{
+  "name": "opengravity-bot",
+  "version": "1.0.0",
+  "description": "OpenGravity Telegram Bot with Ollama",
+  "main": "src/index.js",
+  "scripts": {
+    "start": "node src/index.js",
+    "dev": "nodemon src/index.js"
+  },
+  "keywords": ["telegram", "bot", "ollama", "groq", "openrouter"],
+  "author": "",
+  "license": "MIT",
+  "dependencies": {
+    "telegraf": "^4.14.0",
+    "axios": "^1.6.0",
+    "dotenv": "^16.3.1"
+  },
+  "devDependencies": {
+    "nodemon": "^3.0.1"
+  },
+  "engines": {
+    "node": ">=20.0.0"
+  }
+}
