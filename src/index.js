@@ -472,10 +472,32 @@ bot.on('voice', async (ctx) => {
 // ─────────────────────────────────────────
 // ARRANQUE
 // ─────────────────────────────────────────
-console.log('🚀 Iniciando OpenGravity Bot...');
-bot.launch({ dropPendingUpdates: true })
-  .then(() => console.log('✅ Bot conectado y escuchando mensajes.'))
-  .catch(err => { console.error('❌ Fallo al iniciar:', err); process.exit(1); });
+async function startBot(attempt = 1) {
+  console.log(`🚀 Iniciando OpenGravity Bot... (intento ${attempt})`);
+  try {
+    await bot.telegram.deleteWebhook({ drop_pending_updates: true });
+    console.log('🔁 Sesión anterior limpiada.');
+  } catch (e) {
+    console.warn('Aviso al limpiar webhook:', e.message);
+  }
+  // Esperar a que Railway apague la instancia anterior (más tiempo en reintentos)
+  const delay = attempt === 1 ? 5000 : 15000;
+  await new Promise(r => setTimeout(r, delay));
+  try {
+    await bot.launch({ dropPendingUpdates: true });
+    console.log('✅ Bot conectado y escuchando mensajes.');
+  } catch (err) {
+    if (err.message?.includes('409') && attempt < 5) {
+      console.warn(`⚠️ Conflicto 409, reintentando en 15s... (intento ${attempt}/5)`);
+      await new Promise(r => setTimeout(r, 15000));
+      return startBot(attempt + 1);
+    }
+    console.error('❌ Fallo al iniciar:', err.message);
+    process.exit(1);
+  }
+}
+
+startBot();
 
 process.once('SIGINT', () => bot.stop('SIGINT'));
 process.once('SIGTERM', () => bot.stop('SIGTERM'));
