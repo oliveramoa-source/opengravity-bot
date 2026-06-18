@@ -7,7 +7,7 @@ require('dotenv').config({ path: path.resolve(__dirname, '../.env') });
 const { Telegraf } = require('telegraf');
 const axios = require('axios');
 const fs = require('fs');
-const gtts = require('node-gtts')('es');
+const { MsEdgeTTS, OUTPUT_FORMAT } = require('msedge-tts');
 
 // ─────────────────────────────────────────
 // FIREBASE ADMIN
@@ -306,29 +306,48 @@ async function saveTTSConfig(userId, config) {
   await db.collection('tts_config').doc(String(userId)).set(config, { merge: true });
 }
 
-// Idiomas disponibles para TTS
-const TTS_LANGS = { es: 'Español', en: 'English', pt: 'Português', fr: 'Français', de: 'Deutsch', it: 'Italiano' };
+// Voces disponibles para Edge TTS
+const TTS_VOICES = {
+  'tomas':  { name: 'es-AR-TomasNeural',  label: '🇦🇷 Tomás (hombre, argentino)' },
+  'elena':  { name: 'es-AR-ElenaNeural',   label: '🇦🇷 Elena (mujer, argentina)' },
+  'alvaro': { name: 'es-ES-AlvaroNeural',  label: '🇪🇸 Álvaro (hombre, español)' },
+  'maria':  { name: 'es-MX-DaliaNeural',   label: '🇲🇽 Dalia (mujer, mexicana)' },
+  'brian':  { name: 'en-US-BrianNeural',   label: '🇺🇸 Brian (hombre, inglés)' },
+  'jenny':  { name: 'en-US-JennyNeural',   label: '🇺🇸 Jenny (mujer, inglés)' },
+};
+const DEFAULT_VOICE = 'tomas';
 
 async function textToSpeech(text, userId) {
   try {
     const ttsConfig = await getTTSConfig(userId);
-    const lang = ttsConfig.lang || 'es';
-    // Limpiar markdown para el audio: quitar **, __, `, #, etc.
+    const voiceKey = ttsConfig.voice || DEFAULT_VOICE;
+    const speed = ttsConfig.speed || 1.0;
+    const voiceObj = TTS_VOICES[voiceKey] || TTS_VOICES[DEFAULT_VOICE];
+
+    // Limpiar markdown para el audio
     const clean = text
       .replace(/[*_`#~]/g, '')
       .replace(/\[([^\]]+)\]\([^)]+\)/g, '$1')
       .slice(0, 3000);
+
+    // Convertir speed (0.5–2.0) a porcentaje de Edge TTS (+/-%)
+    const ratePercent = Math.round((speed - 1) * 100);
+    const rate = ratePercent >= 0 ? `+${ratePercent}%` : `${ratePercent}%`;
+
     const audioPath = path.join(__dirname, `tts_${Date.now()}.mp3`);
+    const tts = new MsEdgeTTS();
+    await tts.setMetadata(voiceObj.name, OUTPUT_FORMAT.AUDIO_24KHZ_48KBITRATE_MONO_MP3);
+    const readable = tts.toStream(clean, { rate });
     await new Promise((resolve, reject) => {
-      const g = require('node-gtts')(lang);
-      g.save(audioPath, clean, (err) => {
-        if (err) reject(err);
-        else resolve();
-      });
+      const out = fs.createWriteStream(audioPath);
+      readable.pipe(out);
+      out.on('finish', resolve);
+      out.on('error', reject);
+      readable.on('error', reject);
     });
     return audioPath;
   } catch (error) {
-    console.error('Error TTS:', error.message);
+    console.error('Error TTS Edge:', error.message);
     return null;
   }
 }
@@ -405,8 +424,8 @@ bot.start(async (ctx) => {
     `• Modelo: *${config.model}*\n\n` +
     `Comandos:\n` +
     `/config — ver configuración\n` +
-    `/voz — cambiar voz del audio\n` +
-    `/velocidad — cambiar velocidad del audio\n` +
+    `/voz — cambiar voz (tomas/elena/alvaro/brian...)\n` +
+    `/velocidad — cambiar velocidad (0.5 a 2.0)\n` +
     `/idea [texto] — guardar idea\n` +
     `/ideas — ver tus ideas\n` +
     `/buscar [query] — buscar en la web\n` +
@@ -436,18 +455,19 @@ bot.command('clear', async (ctx) => {
 bot.command('voz', async (ctx) => {
   const arg = ctx.message.text.replace('/voz', '').trim().toLowerCase();
   const cfg = await getTTSConfig(ctx.from.id);
+  const currentVoice = cfg.voice || DEFAULT_VOICE;
   if (!arg) {
-    const opciones = Object.entries(TTS_LANGS).map(([k,v]) => `\`${k}\` — ${v}`).join('\n');
+    const opciones = Object.entries(TTS_VOICES).map(([k, v]) => `\`${k}\` — ${v.label}`).join('\n');
     return ctx.reply(
-      `🎙️ *Configuración de voz actual:*\n• Idioma TTS: \`${cfg.lang || 'es'}\`\n\n` +
-      `*Idiomas disponibles:*\n${opciones}\n\n` +
-      `Uso: \`/voz en\` (para inglés) o \`/voz es\` (español)`,
+      `🎙️ *Configuración de voz actual:*\n• Voz: \`${currentVoice}\` — ${TTS_VOICES[currentVoice]?.label}\n\n` +
+      `*Voces disponibles:*\n${opciones}\n\n` +
+      `Uso: \`/voz tomas\` (hombre argentino) o \`/voz elena\` (mujer argentina)`,
       { parse_mode: 'Markdown' }
     );
   }
-  if (!TTS_LANGS[arg]) return ctx.reply(`Idioma no válido. Opciones: ${Object.keys(TTS_LANGS).join(', ')}`);
-  await saveTTSConfig(ctx.from.id, { lang: arg });
-  await ctx.reply(`✅ Idioma de voz cambiado a \`${arg}\` (${TTS_LANGS[arg]})`, { parse_mode: 'Markdown' });
+  if (!TTS_VOICES[arg]) return ctx.reply(`Voz no válida. Opciones: ${Object.keys(TTS_VOICES).join(', ')}`);
+  await saveTTSConfig(ctx.from.id, { voice: arg });
+  await ctx.reply(`✅ Voz cambiada a \`${arg}\` — ${TTS_VOICES[arg].label}`, { parse_mode: 'Markdown' });
 });
 
 bot.command('velocidad', async (ctx) => {
@@ -460,7 +480,7 @@ bot.command('velocidad', async (ctx) => {
     );
   }
   await saveTTSConfig(ctx.from.id, { speed: arg });
-  await ctx.reply(`✅ Velocidad cambiada a \`${arg}x\`\n_(nota: la velocidad se aplica en futuras versiones del motor TTS)_`, { parse_mode: 'Markdown' });
+  await ctx.reply(`✅ Velocidad cambiada a \`${arg}x\``, { parse_mode: 'Markdown' });
 });
 
 bot.command('idea', async (ctx) => {
