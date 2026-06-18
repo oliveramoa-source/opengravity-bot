@@ -13,17 +13,23 @@ const fs = require('fs');
 // ─────────────────────────────────────────
 const admin = require('firebase-admin');
 
-// Compatibilidad con firebase-admin v9+ y v14+
-// En v14: admin.cert existe directo. En v9-v13: admin.credential.cert
-const certFn = admin.cert || (admin.credential && admin.credential.cert.bind(admin.credential));
+// Soporta dos modos:
+// 1. FIREBASE_SERVICE_ACCOUNT_B64: JSON completo en base64 (recomendado, evita problemas con \n en la clave)
+// 2. Variables individuales: FIREBASE_PROJECT_ID + FIREBASE_CLIENT_EMAIL + FIREBASE_PRIVATE_KEY
+let serviceAccount;
+if (process.env.FIREBASE_SERVICE_ACCOUNT_B64) {
+  serviceAccount = JSON.parse(Buffer.from(process.env.FIREBASE_SERVICE_ACCOUNT_B64, 'base64').toString('utf8'));
+} else {
+  serviceAccount = {
+    type: 'service_account',
+    project_id: process.env.FIREBASE_PROJECT_ID,
+    client_email: process.env.FIREBASE_CLIENT_EMAIL,
+    private_key: process.env.FIREBASE_PRIVATE_KEY?.replace(/\\n/g, '\n'),
+  };
+}
 
-admin.initializeApp({
-  credential: certFn({
-    projectId: process.env.FIREBASE_PROJECT_ID,
-    clientEmail: process.env.FIREBASE_CLIENT_EMAIL,
-    privateKey: process.env.FIREBASE_PRIVATE_KEY?.replace(/\\n/g, '\n'),
-  }),
-});
+const certFn = admin.cert || (admin.credential && admin.credential.cert.bind(admin.credential));
+admin.initializeApp({ credential: certFn(serviceAccount) });
 
 // Compatibilidad Firestore: modular API (v10+) con fallback legacy
 let db;
