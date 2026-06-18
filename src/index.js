@@ -196,10 +196,13 @@ async function searchWeb(query) {
         timeout: 15000,
       }
     );
-    const results = response.data?.data || [];
-    if (!results.length) return null;
+    const results = response.data?.data || response.data?.results || [];
+    if (!results.length) {
+      console.log('Firecrawl search: sin resultados. Raw:', JSON.stringify(response.data).slice(0, 300));
+      return null;
+    }
     return results
-      .map((r, i) => `[${i + 1}] ${r.title}\n${r.url}\n${r.markdown?.slice(0, 500) || ''}`)
+      .map((r, i) => `[${i + 1}] ${r.title || r.url}\n${r.url}\n${(r.markdown || r.description || r.snippet || '').slice(0, 500)}`)
       .join('\n\n');
   } catch (error) {
     console.error('Error Firecrawl search:', error.message);
@@ -565,7 +568,9 @@ bot.on('text', async (ctx) => {
   }
 
   // ── Construcción del prompt y respuesta ──
-  const userContent = extraContext ? `${text}\n\n${extraContext}` : text;
+  const userContent = extraContext
+    ? `${text}\n\n⚠️ IMPORTANTE: Tenés los siguientes datos obtenidos en tiempo real. USÁ ESTA INFORMACIÓN para responder con los datos concretos que encontraste. No digas que no tenés acceso a info en tiempo real.\n${extraContext}`
+    : text;
   await saveMessage(userId, 'user', text);
   const messages = [
     { role: 'system', content: SYSTEM_PROMPT },
