@@ -187,22 +187,29 @@ async function searchWeb(query) {
 // ─────────────────────────────────────────
 // CALL AI
 // ─────────────────────────────────────────
+
+// Limpia los mensajes: solo { role, content } — Groq rechaza campos extra como timestamp
+function cleanMessages(messages) {
+  return messages.map(m => ({ role: m.role, content: m.content }));
+}
+
 async function callAI(messages, config) {
   const headers = { 'Content-Type': 'application/json' };
   const provider = config?.provider || 'groq';
   const model = config?.model || 'llama-3.3-70b-versatile';
+  const clean = cleanMessages(messages);
 
   if (provider === 'groq' && process.env.GROQ_API_KEY) {
     try {
       headers['Authorization'] = `Bearer ${process.env.GROQ_API_KEY}`;
       const response = await axios.post(
         'https://api.groq.com/openai/v1/chat/completions',
-        { model, messages, temperature: 0.7 },
+        { model, messages: clean, temperature: 0.7 },
         { headers, timeout: 30000 }
       );
       return response.data.choices[0].message.content;
     } catch (error) {
-      console.error('Error Groq:', error.message, error.response?.data?.error?.message || '');
+      console.error('Error Groq:', error.response?.data?.error?.message || error.message);
     }
   }
 
@@ -211,7 +218,7 @@ async function callAI(messages, config) {
       headers['Authorization'] = `Bearer ${process.env.OPENROUTER_API_KEY}`;
       const response = await axios.post(
         'https://openrouter.ai/api/v1/chat/completions',
-        { model, messages },
+        { model, messages: clean },
         { headers, timeout: 30000 }
       );
       return response.data.choices[0].message.content;
@@ -223,24 +230,26 @@ async function callAI(messages, config) {
     try {
       const response = await axios.post(
         `${ollamaUrl}/api/chat`,
-        { model: model || 'qwen3:4b', messages, stream: false },
+        { model: model || 'qwen3:4b', messages: clean, stream: false },
         { timeout: 120000 }
       );
       return response.data.message?.content;
     } catch (error) {
       console.error('Error Ollama:', error.message);
-      if (process.env.GROQ_API_KEY) {
-        try {
-          headers['Authorization'] = `Bearer ${process.env.GROQ_API_KEY}`;
-          const response = await axios.post(
-            'https://api.groq.com/openai/v1/chat/completions',
-            { model: 'llama-3.3-70b-versatile', messages, temperature: 0.7 },
-            { headers, timeout: 30000 }
-          );
-          return `[Ollama no disponible — usando Groq]\n\n${response.data.choices[0].message.content}`;
-        } catch (e) { console.error('Error fallback Groq:', e.message); }
-      }
     }
+  }
+
+  // Fallback final: Groq con modelo estable
+  if (process.env.GROQ_API_KEY) {
+    try {
+      headers['Authorization'] = `Bearer ${process.env.GROQ_API_KEY}`;
+      const response = await axios.post(
+        'https://api.groq.com/openai/v1/chat/completions',
+        { model: 'llama-3.3-70b-versatile', messages: clean, temperature: 0.7 },
+        { headers, timeout: 30000 }
+      );
+      return response.data.choices[0].message.content;
+    } catch (error) { console.error('Error fallback Groq:', error.message); }
   }
 
   if (process.env.OPENROUTER_API_KEY) {
@@ -248,14 +257,51 @@ async function callAI(messages, config) {
       headers['Authorization'] = `Bearer ${process.env.OPENROUTER_API_KEY}`;
       const response = await axios.post(
         'https://openrouter.ai/api/v1/chat/completions',
-        { model: 'meta-llama/llama-3.1-8b-instruct', messages },
+        { model: 'meta-llama/llama-3.1-8b-instruct', messages: clean },
         { headers, timeout: 30000 }
       );
-      return `[Fallback OpenRouter]\n\n${response.data.choices[0].message.content}`;
+      return response.data.choices[0].message.content;
     } catch (error) { console.error('Error fallback OpenRouter:', error.message); }
   }
 
   return 'Lo siento, no hay servicios de IA disponibles en este momento.';
+}
+
+// ─────────────────────────────────────────
+// TTS — SÍNTESIS DE VOZ
+// ─────────────────────────────────────────
+async function getTTSConfig(userId) {
+  const doc = await db.collection('tts_config').doc(String(userId)).get();
+  if (!doc.exists) return { voice: 'alloy', speed: 1.0 };
+  return doc.data();
+}
+
+async function saveTTSConfig(userId, config) {
+  await db.collection('tts_config').doc(String(userId)).set(config, { merge: true });
+}
+
+async function textToSpeech(text, userId) {
+  if (!process.env.GROQ_API_KEY) return null;
+  try {
+    const ttsConfig = await getTTSConfig(userId);
+    // Limitar texto a 4096 chars para TTS
+    const truncated = text.slice(0, 4096);
+    const response = await axios.post(
+      'https://api.groq.com/openai/v1/audio/speech',
+      { model: 'playai-tts', voice: ttsConfig.voice, input: truncated, speed: ttsConfig.speed },
+      {
+        headers: { Authorization: `Bearer ${process.env.GROQ_API_KEY}`, 'Content-Type': 'application/json' },
+        responseType: 'arraybuffer',
+        timeout: 30000,
+      }
+    );
+    const audioPath = path.join(__dirname, `tts_${Date.now()}.wav`);
+    fs.writeFileSync(audioPath, response.data);
+    return audioPath;
+  } catch (error) {
+    console.error('Error TTS:', error.response?.data ? Buffer.from(error.response.data).toString() : error.message);
+    return null;
+  }
 }
 
 // ─────────────────────────────────────────
@@ -330,6 +376,8 @@ bot.start(async (ctx) => {
     `• Modelo: *${config.model}*\n\n` +
     `Comandos:\n` +
     `/config — ver configuración\n` +
+    `/voz — cambiar voz del audio\n` +
+    `/velocidad — cambiar velocidad del audio\n` +
     `/idea [texto] — guardar idea\n` +
     `/ideas — ver tus ideas\n` +
     `/buscar [query] — buscar en la web\n` +
@@ -354,6 +402,36 @@ bot.command('config', async (ctx) => {
 bot.command('clear', async (ctx) => {
   await clearHistory(ctx.from.id);
   await ctx.reply('✅ Historial borrado.');
+});
+
+bot.command('voz', async (ctx) => {
+  const arg = ctx.message.text.replace('/voz', '').trim().toLowerCase();
+  const voces = ['alloy', 'echo', 'fable', 'onyx', 'nova', 'shimmer'];
+  if (!arg) {
+    const cfg = await getTTSConfig(ctx.from.id);
+    return ctx.reply(
+      `🎙️ *Configuración de voz actual:*\n• Voz: \`${cfg.voice}\`\n• Velocidad: \`${cfg.speed}x\`\n\n` +
+      `Voces disponibles: ${voces.map(v => `\`${v}\``).join(', ')}\n` +
+      `Uso: \`/voz nova\``,
+      { parse_mode: 'Markdown' }
+    );
+  }
+  if (!voces.includes(arg)) return ctx.reply(`Voz no válida. Opciones: ${voces.join(', ')}`);
+  await saveTTSConfig(ctx.from.id, { voice: arg });
+  await ctx.reply(`✅ Voz cambiada a \`${arg}\``, { parse_mode: 'Markdown' });
+});
+
+bot.command('velocidad', async (ctx) => {
+  const arg = parseFloat(ctx.message.text.replace('/velocidad', '').trim());
+  if (isNaN(arg) || arg < 0.5 || arg > 2.0) {
+    const cfg = await getTTSConfig(ctx.from.id);
+    return ctx.reply(
+      `⚡ *Velocidad actual:* \`${cfg.speed}x\`\n\nUsá un valor entre \`0.5\` y \`2.0\`\nEjemplo: \`/velocidad 1.2\``,
+      { parse_mode: 'Markdown' }
+    );
+  }
+  await saveTTSConfig(ctx.from.id, { speed: arg });
+  await ctx.reply(`✅ Velocidad cambiada a \`${arg}x\``, { parse_mode: 'Markdown' });
 });
 
 bot.command('idea', async (ctx) => {
@@ -389,8 +467,27 @@ bot.command('buscar', async (ctx) => {
   const aiReply = await callAI(messages, config);
   await saveMessage(ctx.from.id, 'user', `/buscar ${query}`);
   await saveMessage(ctx.from.id, 'assistant', aiReply);
-  await ctx.reply(aiReply, { parse_mode: 'Markdown' }).catch(() => ctx.reply(aiReply));
+  await replyWithAudio(ctx, aiReply);
 });
+
+// ─────────────────────────────────────────
+// HELPER: enviar respuesta en texto + audio
+// ─────────────────────────────────────────
+async function replyWithAudio(ctx, text) {
+  // 1. Respuesta en texto
+  await ctx.reply(text, { parse_mode: 'Markdown' }).catch(() => ctx.reply(text));
+  // 2. Respuesta en audio (TTS)
+  const audioPath = await textToSpeech(text, ctx.from.id);
+  if (audioPath) {
+    try {
+      await ctx.replyWithVoice({ source: audioPath });
+    } catch (e) {
+      console.error('Error enviando audio TTS:', e.message);
+    } finally {
+      try { fs.unlinkSync(audioPath); } catch (_) {}
+    }
+  }
+}
 
 // ─────────────────────────────────────────
 // MENSAJES DE TEXTO
@@ -432,7 +529,7 @@ bot.on('text', async (ctx) => {
       const aiReply = await callAI(messages, config);
       await saveMessage(userId, 'user', text);
       await saveMessage(userId, 'assistant', aiReply);
-      return ctx.reply(aiReply, { parse_mode: 'Markdown' }).catch(() => ctx.reply(aiReply));
+      return replyWithAudio(ctx, aiReply);
     }
   }
 
@@ -442,7 +539,7 @@ bot.on('text', async (ctx) => {
   const messages = [{ role: 'system', content: SYSTEM_PROMPT }, ...history];
   const aiReply = await callAI(messages, config);
   await saveMessage(userId, 'assistant', aiReply);
-  await ctx.reply(aiReply, { parse_mode: 'Markdown' }).catch(() => ctx.reply(aiReply));
+  await replyWithAudio(ctx, aiReply);
 });
 
 // ─────────────────────────────────────────
@@ -464,7 +561,7 @@ bot.on('voice', async (ctx) => {
     const messages = [{ role: 'system', content: SYSTEM_PROMPT }, ...history];
     const aiReply = await callAI(messages, config);
     await saveMessage(userId, 'assistant', aiReply);
-    await ctx.reply(aiReply, { parse_mode: 'Markdown' }).catch(() => ctx.reply(aiReply));
+    await replyWithAudio(ctx, aiReply);
   } catch (error) {
     console.error('Error en voice:', error);
     ctx.reply('Ocurrió un error procesando tu audio.');
