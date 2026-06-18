@@ -474,6 +474,19 @@ bot.on('voice', async (ctx) => {
 // ─────────────────────────────────────────
 // ARRANQUE
 // ─────────────────────────────────────────
+async function testGroq() {
+  if (!process.env.GROQ_API_KEY) { console.log('⚠️ GROQ_API_KEY no definida'); return; }
+  try {
+    const r = await axios.post('https://api.groq.com/openai/v1/chat/completions',
+      { model: 'llama-3.3-70b-versatile', messages: [{ role: 'user', content: 'di hola' }], max_tokens: 5 },
+      { headers: { Authorization: `Bearer ${process.env.GROQ_API_KEY}`, 'Content-Type': 'application/json' }, timeout: 10000 }
+    );
+    console.log('✅ Groq OK:', r.data.choices[0].message.content.slice(0, 30));
+  } catch (e) {
+    console.error('❌ Groq FALLA:', e.response?.status, JSON.stringify(e.response?.data?.error));
+  }
+}
+
 async function startBot(attempt = 1) {
   console.log(`🚀 Iniciando OpenGravity Bot... (intento ${attempt})`);
   try {
@@ -482,6 +495,7 @@ async function startBot(attempt = 1) {
   } catch (e) {
     console.warn('Aviso al limpiar webhook:', e.message);
   }
+  await testGroq();
   // Esperar a que Railway apague la instancia anterior (más tiempo en reintentos)
   const delay = attempt === 1 ? 5000 : 15000;
   await new Promise(r => setTimeout(r, delay));
