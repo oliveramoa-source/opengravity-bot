@@ -201,7 +201,9 @@ async function callAI(messages, config) {
         { headers, timeout: 30000 }
       );
       return response.data.choices[0].message.content;
-    } catch (error) { console.error('Error Groq:', error.message); }
+    } catch (error) {
+      console.error('Error Groq:', error.message, error.response?.data?.error?.message || '');
+    }
   }
 
   if (provider === 'openrouter' && process.env.OPENROUTER_API_KEY) {
@@ -246,7 +248,7 @@ async function callAI(messages, config) {
       headers['Authorization'] = `Bearer ${process.env.OPENROUTER_API_KEY}`;
       const response = await axios.post(
         'https://openrouter.ai/api/v1/chat/completions',
-        { model: 'meta-llama/llama-3.1-8b-instruct:free', messages },
+        { model: 'meta-llama/llama-3.1-8b-instruct', messages },
         { headers, timeout: 30000 }
       );
       return `[Fallback OpenRouter]\n\n${response.data.choices[0].message.content}`;
