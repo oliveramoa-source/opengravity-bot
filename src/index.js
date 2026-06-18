@@ -7,6 +7,7 @@ require('dotenv').config({ path: path.resolve(__dirname, '../.env') });
 const { Telegraf } = require('telegraf');
 const axios = require('axios');
 const fs = require('fs');
+const gtts = require('node-gtts')('es');
 
 // ─────────────────────────────────────────
 // FIREBASE ADMIN
@@ -157,8 +158,33 @@ REGLAS:
 `;
 
 // ─────────────────────────────────────────
-// BÚSQUEDA WEB CON FIRECRAWL
+// WEB: BÚSQUEDA + LECTURA DE URLS (Firecrawl)
 // ─────────────────────────────────────────
+function extractUrls(text) {
+  const urlRegex = /https?:\/\/[^\s<>"{}|\\^`\[\]]+/gi;
+  return text.match(urlRegex) || [];
+}
+
+async function scrapeUrl(url) {
+  if (!process.env.FIRECRAWL_API_KEY) return null;
+  try {
+    const response = await axios.post(
+      'https://api.firecrawl.dev/v1/scrape',
+      { url, formats: ['markdown'] },
+      {
+        headers: { Authorization: `Bearer ${process.env.FIRECRAWL_API_KEY}`, 'Content-Type': 'application/json' },
+        timeout: 20000,
+      }
+    );
+    const md = response.data?.data?.markdown || response.data?.markdown || '';
+    if (!md) return null;
+    return `📄 *Contenido de ${url}:*\n\n${md.slice(0, 2000)}`;
+  } catch (error) {
+    console.error('Error scraping URL:', error.message);
+    return null;
+  }
+}
+
 async function searchWeb(query) {
   if (!process.env.FIRECRAWL_API_KEY) return null;
   try {
@@ -166,10 +192,7 @@ async function searchWeb(query) {
       'https://api.firecrawl.dev/v1/search',
       { query, limit: 3 },
       {
-        headers: {
-          Authorization: `Bearer ${process.env.FIRECRAWL_API_KEY}`,
-          'Content-Type': 'application/json',
-        },
+        headers: { Authorization: `Bearer ${process.env.FIRECRAWL_API_KEY}`, 'Content-Type': 'application/json' },
         timeout: 15000,
       }
     );
@@ -179,7 +202,7 @@ async function searchWeb(query) {
       .map((r, i) => `[${i + 1}] ${r.title}\n${r.url}\n${r.markdown?.slice(0, 500) || ''}`)
       .join('\n\n');
   } catch (error) {
-    console.error('Error Firecrawl:', error.message);
+    console.error('Error Firecrawl search:', error.message);
     return null;
   }
 }
@@ -268,11 +291,11 @@ async function callAI(messages, config) {
 }
 
 // ─────────────────────────────────────────
-// TTS — SÍNTESIS DE VOZ
+// TTS — SÍNTESIS DE VOZ (node-gtts / Google)
 // ─────────────────────────────────────────
 async function getTTSConfig(userId) {
   const doc = await db.collection('tts_config').doc(String(userId)).get();
-  if (!doc.exists) return { voice: 'alloy', speed: 1.0 };
+  if (!doc.exists) return { lang: 'es', speed: 1.0 };
   return doc.data();
 }
 
@@ -280,26 +303,29 @@ async function saveTTSConfig(userId, config) {
   await db.collection('tts_config').doc(String(userId)).set(config, { merge: true });
 }
 
+// Idiomas disponibles para TTS
+const TTS_LANGS = { es: 'Español', en: 'English', pt: 'Português', fr: 'Français', de: 'Deutsch', it: 'Italiano' };
+
 async function textToSpeech(text, userId) {
-  if (!process.env.GROQ_API_KEY) return null;
   try {
     const ttsConfig = await getTTSConfig(userId);
-    // Limitar texto a 4096 chars para TTS
-    const truncated = text.slice(0, 4096);
-    const response = await axios.post(
-      'https://api.groq.com/openai/v1/audio/speech',
-      { model: 'playai-tts', voice: ttsConfig.voice, input: truncated, speed: ttsConfig.speed },
-      {
-        headers: { Authorization: `Bearer ${process.env.GROQ_API_KEY}`, 'Content-Type': 'application/json' },
-        responseType: 'arraybuffer',
-        timeout: 30000,
-      }
-    );
-    const audioPath = path.join(__dirname, `tts_${Date.now()}.wav`);
-    fs.writeFileSync(audioPath, response.data);
+    const lang = ttsConfig.lang || 'es';
+    // Limpiar markdown para el audio: quitar **, __, `, #, etc.
+    const clean = text
+      .replace(/[*_`#~]/g, '')
+      .replace(/\[([^\]]+)\]\([^)]+\)/g, '$1')
+      .slice(0, 3000);
+    const audioPath = path.join(__dirname, `tts_${Date.now()}.mp3`);
+    await new Promise((resolve, reject) => {
+      const g = require('node-gtts')(lang);
+      g.save(audioPath, clean, (err) => {
+        if (err) reject(err);
+        else resolve();
+      });
+    });
     return audioPath;
   } catch (error) {
-    console.error('Error TTS:', error.response?.data ? Buffer.from(error.response.data).toString() : error.message);
+    console.error('Error TTS:', error.message);
     return null;
   }
 }
@@ -406,32 +432,32 @@ bot.command('clear', async (ctx) => {
 
 bot.command('voz', async (ctx) => {
   const arg = ctx.message.text.replace('/voz', '').trim().toLowerCase();
-  const voces = ['alloy', 'echo', 'fable', 'onyx', 'nova', 'shimmer'];
+  const cfg = await getTTSConfig(ctx.from.id);
   if (!arg) {
-    const cfg = await getTTSConfig(ctx.from.id);
+    const opciones = Object.entries(TTS_LANGS).map(([k,v]) => `\`${k}\` — ${v}`).join('\n');
     return ctx.reply(
-      `🎙️ *Configuración de voz actual:*\n• Voz: \`${cfg.voice}\`\n• Velocidad: \`${cfg.speed}x\`\n\n` +
-      `Voces disponibles: ${voces.map(v => `\`${v}\``).join(', ')}\n` +
-      `Uso: \`/voz nova\``,
+      `🎙️ *Configuración de voz actual:*\n• Idioma TTS: \`${cfg.lang || 'es'}\`\n\n` +
+      `*Idiomas disponibles:*\n${opciones}\n\n` +
+      `Uso: \`/voz en\` (para inglés) o \`/voz es\` (español)`,
       { parse_mode: 'Markdown' }
     );
   }
-  if (!voces.includes(arg)) return ctx.reply(`Voz no válida. Opciones: ${voces.join(', ')}`);
-  await saveTTSConfig(ctx.from.id, { voice: arg });
-  await ctx.reply(`✅ Voz cambiada a \`${arg}\``, { parse_mode: 'Markdown' });
+  if (!TTS_LANGS[arg]) return ctx.reply(`Idioma no válido. Opciones: ${Object.keys(TTS_LANGS).join(', ')}`);
+  await saveTTSConfig(ctx.from.id, { lang: arg });
+  await ctx.reply(`✅ Idioma de voz cambiado a \`${arg}\` (${TTS_LANGS[arg]})`, { parse_mode: 'Markdown' });
 });
 
 bot.command('velocidad', async (ctx) => {
   const arg = parseFloat(ctx.message.text.replace('/velocidad', '').trim());
+  const cfg = await getTTSConfig(ctx.from.id);
   if (isNaN(arg) || arg < 0.5 || arg > 2.0) {
-    const cfg = await getTTSConfig(ctx.from.id);
     return ctx.reply(
-      `⚡ *Velocidad actual:* \`${cfg.speed}x\`\n\nUsá un valor entre \`0.5\` y \`2.0\`\nEjemplo: \`/velocidad 1.2\``,
+      `⚡ *Velocidad actual:* \`${cfg.speed || 1.0}x\`\n\nUsá un valor entre \`0.5\` y \`2.0\`\nEjemplo: \`/velocidad 1.2\``,
       { parse_mode: 'Markdown' }
     );
   }
   await saveTTSConfig(ctx.from.id, { speed: arg });
-  await ctx.reply(`✅ Velocidad cambiada a \`${arg}x\``, { parse_mode: 'Markdown' });
+  await ctx.reply(`✅ Velocidad cambiada a \`${arg}x\`\n_(nota: la velocidad se aplica en futuras versiones del motor TTS)_`, { parse_mode: 'Markdown' });
 });
 
 bot.command('idea', async (ctx) => {
@@ -497,6 +523,7 @@ bot.on('text', async (ctx) => {
   const text = ctx.message.text;
   await ctx.sendChatAction('typing');
 
+  // ── Cambio de configuración por lenguaje natural ──
   const configKeywords = ['cambiá', 'cambia', 'usá', 'usa', 'cambiame', 'cambiar', 'pasá', 'pasa'];
   const isConfig = configKeywords.some(k => text.toLowerCase().includes(k)) &&
     ['groq', 'openrouter', 'ollama', 'modelo'].some(k => text.toLowerCase().includes(k));
@@ -512,31 +539,39 @@ bot.on('text', async (ctx) => {
     );
   }
 
-  const searchKeywords = ['buscá', 'busca', 'buscame', 'investigá', 'investiga', 'precio de', 'cotización'];
-  const isSearch = searchKeywords.some(k => text.toLowerCase().includes(k));
+  const config = await getConfig(userId);
+  const history = await getHistory(userId);
+  let extraContext = '';
+
+  // ── Lectura de URLs en el mensaje ──
+  const urls = extractUrls(text);
+  if (urls.length > 0 && process.env.FIRECRAWL_API_KEY) {
+    await ctx.reply('🌐 Leyendo el enlace...');
+    for (const url of urls.slice(0, 2)) {
+      const content = await scrapeUrl(url);
+      if (content) extraContext += `\n\n${content}`;
+    }
+  }
+
+  // ── Búsqueda web proactiva ──
+  const searchKeywords = ['buscá', 'busca', 'buscame', 'investigá', 'investiga', 'precio de', 'cotización',
+    'noticias', 'últimas noticias', 'hoy', 'ahora', 'actualidad', 'qué pasó', 'que paso'];
+  const isSearch = !urls.length && searchKeywords.some(k => text.toLowerCase().includes(k));
 
   if (isSearch && process.env.FIRECRAWL_API_KEY) {
     await ctx.reply('🔍 Buscando en la web...');
     const results = await searchWeb(text);
-    if (results) {
-      const config = await getConfig(userId);
-      const history = await getHistory(userId);
-      const messages = [
-        { role: 'system', content: SYSTEM_PROMPT },
-        ...history,
-        { role: 'user', content: `${text}\n\nResultados web:\n${results}` },
-      ];
-      const aiReply = await callAI(messages, config);
-      await saveMessage(userId, 'user', text);
-      await saveMessage(userId, 'assistant', aiReply);
-      return replyWithAudio(ctx, aiReply);
-    }
+    if (results) extraContext += `\n\nResultados web:\n${results}`;
   }
 
+  // ── Construcción del prompt y respuesta ──
+  const userContent = extraContext ? `${text}\n\n${extraContext}` : text;
   await saveMessage(userId, 'user', text);
-  const config = await getConfig(userId);
-  const history = await getHistory(userId);
-  const messages = [{ role: 'system', content: SYSTEM_PROMPT }, ...history];
+  const messages = [
+    { role: 'system', content: SYSTEM_PROMPT },
+    ...history,
+    { role: 'user', content: userContent },
+  ];
   const aiReply = await callAI(messages, config);
   await saveMessage(userId, 'assistant', aiReply);
   await replyWithAudio(ctx, aiReply);
