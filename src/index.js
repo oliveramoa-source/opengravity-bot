@@ -155,6 +155,9 @@ REGLAS:
 - Sé directo y sin preámbulos innecesarios
 - Para temas legales: no des asesoramiento vinculante
 - Recordás todo lo que Mariano te contó en conversaciones anteriores
+- NUNCA inventes datos en tiempo real (hora, fecha, cotizaciones, noticias) si no te los proporcionaron explícitamente en el mensaje. Si no tenés el dato, decilo claramente.
+- NUNCA afirmes haber cambiado tu propia voz, velocidad o configuración técnica. Esos cambios los maneja el sistema, no vos. Si te piden cambiar la voz, no respondas nada sobre eso — el sistema ya lo procesó aparte.
+- Respondé exactamente lo que se te pide, sin agregar información no solicitada.
 `;
 
 // ─────────────────────────────────────────
@@ -432,6 +435,39 @@ function parseConfigCommand(text) {
   return { provider, model };
 }
 
+// Detecta pedidos de cambio de voz/velocidad en lenguaje natural (texto o audio transcripto)
+function parseVoiceCommand(text) {
+  const t = text.toLowerCase();
+  const isVoiceRequest = /\b(cambi\w*|pon\w*|us\w*|quier\w*)\b.*\b(voz|velocidad)\b/.test(t) ||
+    /\bvoz\s+(femenina|masculina|de\s+(hombre|mujer))\b/.test(t) ||
+    /\bm[aá]s\s+(r[aá]pido|lent[oa])\b/.test(t);
+
+  if (!isVoiceRequest) return null;
+
+  let voice = null;
+  let speed = null;
+
+  if (/femenina|de\s+mujer|mujer/.test(t)) voice = 'elena';
+  else if (/masculina|de\s+hombre|hombre/.test(t)) voice = 'tomas';
+  else {
+    for (const key of Object.keys(TTS_VOICES)) {
+      if (t.includes(key)) { voice = key; break; }
+    }
+  }
+
+  const speedMatch = t.match(/(\d+(?:[.,]\d+)?)\s*(?:x|veces)/);
+  if (speedMatch) {
+    speed = parseFloat(speedMatch[1].replace(',', '.'));
+  } else if (/m[aá]s\s+r[aá]pido/.test(t)) {
+    speed = 1.3;
+  } else if (/m[aá]s\s+lent[oa]/.test(t)) {
+    speed = 0.8;
+  }
+
+  if (!voice && !speed) return null;
+  return { voice, speed };
+}
+
 // ─────────────────────────────────────────
 // COMANDOS
 // ─────────────────────────────────────────
@@ -574,6 +610,26 @@ async function handleUserText(ctx, text) {
     return replyWithAudio(ctx, reply);
   }
 
+  // ── Cambio de voz/velocidad por lenguaje natural (texto o audio) ──
+  const voiceCmd = parseVoiceCommand(text);
+  if (voiceCmd) {
+    const currentTts = await getTTSConfig(userId);
+    const newTts = {
+      voice: voiceCmd.voice || currentTts.voice || DEFAULT_VOICE,
+      speed: voiceCmd.speed || currentTts.speed || 1.0,
+    };
+    await saveTTSConfig(userId, newTts);
+    const voiceLabel = TTS_VOICES[newTts.voice]?.label || newTts.voice;
+    const reply = `✅ Listo. Voz: ${voiceLabel} — Velocidad: ${newTts.speed}x`;
+    await ctx.reply(reply, { parse_mode: 'Markdown' });
+    const audioPath = await textToSpeech('Listo, así suena la voz ahora.', userId);
+    if (audioPath) {
+      try { await ctx.replyWithVoice({ source: audioPath }); }
+      finally { try { fs.unlinkSync(audioPath); } catch (_) {} }
+    }
+    return;
+  }
+
   // ── Cambio de configuración por lenguaje natural ──
   const configKeywords = ['cambiá', 'cambia', 'usá', 'usa', 'cambiame', 'cambiar', 'pasá', 'pasa'];
   const isConfig = configKeywords.some(k => text.toLowerCase().includes(k)) &&
@@ -606,7 +662,7 @@ async function handleUserText(ctx, text) {
 
   // ── Búsqueda web proactiva ──
   const searchKeywords = ['buscá', 'busca', 'buscame', 'investigá', 'investiga', 'precio de', 'cotización',
-    'noticias', 'últimas noticias', 'hoy', 'ahora', 'actualidad', 'qué pasó', 'que paso'];
+    'noticias', 'últimas noticias', 'qué pasó', 'que paso'];
   const isSearch = !urls.length && searchKeywords.some(k => text.toLowerCase().includes(k));
 
   if (isSearch && process.env.FIRECRAWL_API_KEY) {
