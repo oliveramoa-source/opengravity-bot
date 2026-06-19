@@ -158,6 +158,26 @@ REGLAS:
 `;
 
 // ─────────────────────────────────────────
+// FECHA Y HORA (cálculo directo, sin IA ni web)
+// ─────────────────────────────────────────
+const TIME_KEYWORDS = ['qué hora es', 'que hora es', 'hora actual', 'hora en argentina', 'qué día es', 'que dia es', 'fecha de hoy', 'fecha actual'];
+
+function isTimeQuery(text) {
+  const t = text.toLowerCase();
+  return TIME_KEYWORDS.some(k => t.includes(k));
+}
+
+function getArgentinaDateTime() {
+  const now = new Date();
+  const formatter = new Intl.DateTimeFormat('es-AR', {
+    timeZone: 'America/Argentina/Buenos_Aires',
+    weekday: 'long', year: 'numeric', month: 'long', day: 'numeric',
+    hour: '2-digit', minute: '2-digit', second: '2-digit', hour12: false,
+  });
+  return formatter.format(now);
+}
+
+// ─────────────────────────────────────────
 // WEB: BÚSQUEDA + LECTURA DE URLS (Firecrawl)
 // ─────────────────────────────────────────
 function extractUrls(text) {
@@ -337,13 +357,13 @@ async function textToSpeech(text, userId) {
     const audioPath = path.join(__dirname, `tts_${Date.now()}.mp3`);
     const tts = new MsEdgeTTS();
     await tts.setMetadata(voiceObj.name, OUTPUT_FORMAT.AUDIO_24KHZ_48KBITRATE_MONO_MP3);
-    const readable = tts.toStream(clean, { rate });
+    const { audioStream } = tts.toStream(clean, { rate });
     await new Promise((resolve, reject) => {
       const out = fs.createWriteStream(audioPath);
-      readable.pipe(out);
+      audioStream.pipe(out);
       out.on('finish', resolve);
       out.on('error', reject);
-      readable.on('error', reject);
+      audioStream.on('error', reject);
     });
     return audioPath;
   } catch (error) {
@@ -541,10 +561,18 @@ async function replyWithAudio(ctx, text) {
 // ─────────────────────────────────────────
 // MENSAJES DE TEXTO
 // ─────────────────────────────────────────
-bot.on('text', async (ctx) => {
+// Procesa un mensaje de usuario (de texto o transcripto de audio) y responde con texto + audio.
+async function handleUserText(ctx, text) {
   const userId = ctx.from.id;
-  const text = ctx.message.text;
-  await ctx.sendChatAction('typing');
+
+  // ── Hora/fecha exacta — cálculo directo, sin inventar nada ──
+  if (isTimeQuery(text)) {
+    const datetime = getArgentinaDateTime();
+    const reply = `🕐 En Argentina son las: *${datetime}*`;
+    await saveMessage(userId, 'user', text);
+    await saveMessage(userId, 'assistant', reply);
+    return replyWithAudio(ctx, reply);
+  }
 
   // ── Cambio de configuración por lenguaje natural ──
   const configKeywords = ['cambiá', 'cambia', 'usá', 'usa', 'cambiame', 'cambiar', 'pasá', 'pasa'];
@@ -600,6 +628,11 @@ bot.on('text', async (ctx) => {
   const aiReply = await callAI(messages, config);
   await saveMessage(userId, 'assistant', aiReply);
   await replyWithAudio(ctx, aiReply);
+}
+
+bot.on('text', async (ctx) => {
+  await ctx.sendChatAction('typing');
+  await handleUserText(ctx, ctx.message.text);
 });
 
 // ─────────────────────────────────────────
@@ -615,13 +648,7 @@ bot.on('voice', async (ctx) => {
     const transcribed = await transcribeAudio(fileUrl);
     if (!transcribed) return ctx.reply('❌ No pude entender el audio.');
     await ctx.reply(`🎤 *Dijiste:* "${transcribed}"`, { parse_mode: 'Markdown' });
-    await saveMessage(userId, 'user', `[Audio]: ${transcribed}`);
-    const config = await getConfig(userId);
-    const history = await getHistory(userId);
-    const messages = [{ role: 'system', content: SYSTEM_PROMPT }, ...history];
-    const aiReply = await callAI(messages, config);
-    await saveMessage(userId, 'assistant', aiReply);
-    await replyWithAudio(ctx, aiReply);
+    await handleUserText(ctx, transcribed);
   } catch (error) {
     console.error('Error en voice:', error);
     ctx.reply('Ocurrió un error procesando tu audio.');
