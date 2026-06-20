@@ -210,6 +210,18 @@ async function scrapeUrl(url) {
   }
 }
 
+// Detecta si un mensaje contiene varias preguntas separadas (numeradas o entre comillas) y las separa
+function splitQueries(text) {
+  const quoted = [...text.matchAll(/"([^"]+)"/g)].map(m => m[1].trim());
+  if (quoted.length >= 2) return quoted;
+
+  const numbered = text.split(/\n|(?=\d\s*[\).-])/).map(s => s.trim()).filter(Boolean);
+  const cleaned = numbered.map(s => s.replace(/^\d+\s*[\).-]\s*/, '').trim()).filter(s => s.length > 3);
+  if (cleaned.length >= 2) return cleaned;
+
+  return [text];
+}
+
 async function searchWeb(query) {
   if (!process.env.FIRECRAWL_API_KEY) return null;
   try {
@@ -669,8 +681,11 @@ async function handleUserText(ctx, text) {
 
   if (isSearch && process.env.FIRECRAWL_API_KEY) {
     await ctx.reply('🔍 Buscando en la web...');
-    const results = await searchWeb(text);
-    if (results) extraContext += `\n\nResultados web:\n${results}`;
+    const queries = splitQueries(text).slice(0, 4);
+    for (const q of queries) {
+      const results = await searchWeb(q);
+      if (results) extraContext += `\n\nResultados para "${q}":\n${results}`;
+    }
   }
 
   // ── Construcción del prompt y respuesta ──
