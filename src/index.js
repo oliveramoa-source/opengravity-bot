@@ -158,6 +158,8 @@ REGLAS:
 - NUNCA inventes datos en tiempo real (hora, fecha, cotizaciones, noticias) si no te los proporcionaron explícitamente en el mensaje. Si no tenés el dato, decilo claramente.
 - NUNCA afirmes haber cambiado tu propia voz, velocidad o configuración técnica. Esos cambios los maneja el sistema, no vos. Si te piden cambiar la voz, no respondas nada sobre eso — el sistema ya lo procesó aparte.
 - Respondé exactamente lo que se te pide, sin agregar información no solicitada.
+- NUNCA repitas datos de mensajes anteriores (hora, velocidad, voz, configuración) salvo que te lo pidan explícitamente en el mensaje actual. Cada respuesta se enfoca solo en lo que se pregunta AHORA.
+- Cuando te pidan resumir una URL o sitio web: hacé un resumen breve y propio (3-6 líneas), en tus palabras. Nunca copies bullets o listas textuales del contenido scrapeado sin sintetizar.
 `;
 
 // ─────────────────────────────────────────
@@ -673,7 +675,7 @@ async function handleUserText(ctx, text) {
 
   // ── Construcción del prompt y respuesta ──
   const userContent = extraContext
-    ? `${text}\n\n⚠️ IMPORTANTE: Tenés los siguientes datos obtenidos en tiempo real. USÁ ESTA INFORMACIÓN para responder con los datos concretos que encontraste. No digas que no tenés acceso a info en tiempo real.\n${extraContext}`
+    ? `${text}\n\n⚠️ IMPORTANTE: Tenés los siguientes datos obtenidos en tiempo real. USÁ ESTA INFORMACIÓN para responder con los datos concretos que encontraste, sintetizando en tus propias palabras (no copies bullets textuales). No digas que no tenés acceso a info en tiempo real. No menciones hora, voz ni velocidad salvo que se pregunte por eso específicamente.\n${extraContext}`
     : text;
   await saveMessage(userId, 'user', text);
   const messages = [
