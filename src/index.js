@@ -160,6 +160,8 @@ REGLAS:
 - Respondé exactamente lo que se te pide, sin agregar información no solicitada.
 - NUNCA repitas datos de mensajes anteriores (hora, velocidad, voz, configuración) salvo que te lo pidan explícitamente en el mensaje actual. Cada respuesta se enfoca solo en lo que se pregunta AHORA.
 - Cuando te pidan resumir una URL o sitio web: hacé un resumen breve y propio (3-6 líneas), en tus palabras. Nunca copies bullets o listas textuales del contenido scrapeado sin sintetizar.
+- Respondé SIEMPRE en español, sin mezclar palabras en inglés (ej: no usar "making it" ni anglicismos sueltos).
+- Para temas legales con datos específicos (montos, porcentajes, comparaciones "antes vs. después", artículos de ley): si NO tenés resultados de búsqueda en este mensaje, decí explícitamente "no tengo ese dato verificado, necesito buscarlo" en vez de inventar cifras o comparaciones. Nunca presentes una comparación legal específica como un hecho si no viene de una fuente provista en el contexto.
 `;
 
 // ─────────────────────────────────────────
@@ -243,9 +245,21 @@ function cleanQuery(text) {
   return cleaned.length >= 3 ? cleaned : text.trim();
 }
 
+// Lista de países/jurisdicciones que, si aparecen en la query, evitan que forcemos "Argentina"
+const OTHER_COUNTRIES = ['california', 'costa rica', 'méxico', 'mexico', 'españa', 'espana', 'chile',
+  'uruguay', 'brasil', 'colombia', 'perú', 'peru', 'estados unidos', 'eeuu', 'usa', 'venezuela'];
+
+// Este bot es para un abogado argentino: si la query no especifica otro país, anclamos a Argentina
+// para evitar que la búsqueda traiga resultados de otras jurisdicciones (bug real observado: "reforma laboral" sin anclar trajo resultados de California y Costa Rica)
+function anchorToArgentina(query) {
+  const q = query.toLowerCase();
+  if (q.includes('argentina') || OTHER_COUNTRIES.some(c => q.includes(c))) return query;
+  return `${query} Argentina`;
+}
+
 async function searchWeb(query) {
   if (!process.env.TAVILY_API_KEY) return null;
-  const cleanedQuery = cleanQuery(query);
+  const cleanedQuery = anchorToArgentina(cleanQuery(query));
   if (cleanedQuery.length < 2) {
     console.log('Tavily: query descartada por ser muy corta:', JSON.stringify(query));
     return null;
@@ -708,18 +722,38 @@ async function handleUserText(ctx, text) {
     }
   }
 
-  // ── Búsqueda web proactiva ──
+  // ── Búsqueda web proactiva (incluye pedidos de seguimiento/profundización) ──
   const searchKeywords = ['buscá', 'busca', 'buscame', 'investigá', 'investiga', 'precio de', 'cotización',
     'noticias', 'últimas noticias', 'qué pasó', 'que paso'];
-  const isSearch = !urls.length && searchKeywords.some(k => text.toLowerCase().includes(k));
+  const followUpKeywords = ['compará', 'compara', 'comparame', 'diferencia', 'qué cambió', 'que cambio',
+    'cómo era antes', 'como era antes', 'profundizá', 'profundiza', 'explicá más', 'explica mas',
+    'detalle', 'detallame', 'ampliá', 'amplia', 'amplíame', 'ampliame', 'más información', 'mas informacion'];
 
-  if (isSearch && process.env.FIRECRAWL_API_KEY) {
+  const explicitSearch = searchKeywords.some(k => text.toLowerCase().includes(k));
+  const isFollowUp = followUpKeywords.some(k => text.toLowerCase().includes(k));
+
+  // Búsqueda "pegajosa": si el mensaje anterior del bot incluyó búsqueda web reciente,
+  // un pedido de profundización also dispara nueva búsqueda usando el tema anterior + lo nuevo.
+  let stickyTopic = null;
+  if (isFollowUp && !explicitSearch) {
+    const ttsCfgForSticky = await getConfig(userId);
+    const lastTopic = ttsCfgForSticky.lastSearchTopic;
+    const lastAt = ttsCfgForSticky.lastSearchAt ? new Date(ttsCfgForSticky.lastSearchAt).getTime() : 0;
+    if (lastTopic && Date.now() - lastAt < 15 * 60 * 1000) stickyTopic = lastTopic;
+  }
+
+  const isSearch = !urls.length && (explicitSearch || isFollowUp);
+
+  if (isSearch && process.env.TAVILY_API_KEY) {
     await ctx.reply('🔍 Buscando en la web...');
-    const queries = splitQueries(text).slice(0, 4);
+    const baseText = stickyTopic ? `${stickyTopic} — ${text}` : text;
+    const queries = splitQueries(baseText).slice(0, 4);
     for (const q of queries) {
       const results = await searchWeb(q);
       if (results) extraContext += `\n\nResultados para "${q}":\n${results}`;
     }
+    // Guarda el tema para sostener la búsqueda en próximos mensajes de seguimiento
+    await saveConfig(userId, { lastSearchTopic: text.slice(0, 200), lastSearchAt: new Date().toISOString() });
   }
 
   // ── Construcción del prompt y respuesta ──
