@@ -222,27 +222,45 @@ function splitQueries(text) {
   return [text];
 }
 
+// Quita verbos/frases de instrucción ("buscá", "investigá", "dame un resumen de") para dejar la query limpia
+function cleanQuery(text) {
+  return text
+    .replace(/\b(busc\w*|investig\w*|consult\w*|dame\s+(un\s+)?resumen\s+(breve\s+)?(de|sobre)?|quiero\s+saber)\b/gi, '')
+    .replace(/^\s*[:\-–]\s*/, '')
+    .replace(/\s{2,}/g, ' ')
+    .trim();
+}
+
 async function searchWeb(query) {
-  if (!process.env.FIRECRAWL_API_KEY) return null;
+  if (!process.env.TAVILY_API_KEY) return null;
+  const cleanedQuery = cleanQuery(query) || query;
   try {
     const response = await axios.post(
-      'https://api.firecrawl.dev/v1/search',
-      { query, limit: 3 },
+      'https://api.tavily.com/search',
       {
-        headers: { Authorization: `Bearer ${process.env.FIRECRAWL_API_KEY}`, 'Content-Type': 'application/json' },
-        timeout: 15000,
-      }
+        api_key: process.env.TAVILY_API_KEY,
+        query: cleanedQuery,
+        search_depth: 'basic',
+        include_answer: true,
+        max_results: 4,
+      },
+      { headers: { 'Content-Type': 'application/json' }, timeout: 15000 }
     );
-    const results = response.data?.data || response.data?.results || [];
-    if (!results.length) {
-      console.log('Firecrawl search: sin resultados. Raw:', JSON.stringify(response.data).slice(0, 300));
+    const { answer, results } = response.data || {};
+    if (!answer && !(results && results.length)) {
+      console.log('Tavily: sin resultados para', cleanedQuery);
       return null;
     }
-    return results
-      .map((r, i) => `[${i + 1}] ${r.title || r.url}\n${r.url}\n${(r.markdown || r.description || r.snippet || '').slice(0, 500)}`)
-      .join('\n\n');
+    let out = '';
+    if (answer) out += `Respuesta directa: ${answer}\n\n`;
+    if (results && results.length) {
+      out += results
+        .map((r, i) => `[${i + 1}] ${r.title}\n${r.url}\n${(r.content || '').slice(0, 400)}`)
+        .join('\n\n');
+    }
+    return out.trim();
   } catch (error) {
-    console.error('Error Firecrawl search:', error.message);
+    console.error('Error Tavily search:', error.response?.data || error.message);
     return null;
   }
 }
