@@ -210,13 +210,21 @@ async function scrapeUrl(url) {
   }
 }
 
+// Normaliza comillas tipográficas (“ ” ‘ ’) a comillas rectas, por si Telegram las autoconvierte
+function normalizeQuotes(text) {
+  return text.replace(/[“”]/g, '"').replace(/[‘’]/g, "'");
+}
+
 // Detecta si un mensaje contiene varias preguntas separadas (numeradas o entre comillas) y las separa
-function splitQueries(text) {
-  const quoted = [...text.matchAll(/"([^"]+)"/g)].map(m => m[1].trim());
+function splitQueries(rawText) {
+  const text = normalizeQuotes(rawText);
+  const quoted = [...text.matchAll(/"([^"]+)"/g)].map(m => m[1].trim()).filter(s => s.length >= 3);
   if (quoted.length >= 2) return quoted;
 
   const numbered = text.split(/\n|(?=\d\s*[\).-])/).map(s => s.trim()).filter(Boolean);
-  const cleaned = numbered.map(s => s.replace(/^\d+\s*[\).-]\s*/, '').trim()).filter(s => s.length > 3);
+  const cleaned = numbered
+    .map(s => s.replace(/^\d+\s*[\).-]\s*/, '').replace(/^["']|["']$/g, '').trim())
+    .filter(s => s.length >= 3);
   if (cleaned.length >= 2) return cleaned;
 
   return [text];
@@ -224,16 +232,24 @@ function splitQueries(text) {
 
 // Quita verbos/frases de instrucción ("buscá", "investigá", "dame un resumen de") para dejar la query limpia
 function cleanQuery(text) {
-  return text
+  const cleaned = text
     .replace(/\b(busc\w*|investig\w*|consult\w*|dame\s+(un\s+)?resumen\s+(breve\s+)?(de|sobre)?|quiero\s+saber)\b/gi, '')
     .replace(/^\s*[:\-–]\s*/, '')
+    .replace(/^\d+\s*[\).-]?\s*/, '')
+    .replace(/^["']|["']$/g, '')
     .replace(/\s{2,}/g, ' ')
     .trim();
+  // Si la limpieza dejó muy poco texto, usar el original (sin tocar) en vez de mandar basura
+  return cleaned.length >= 3 ? cleaned : text.trim();
 }
 
 async function searchWeb(query) {
   if (!process.env.TAVILY_API_KEY) return null;
-  const cleanedQuery = cleanQuery(query) || query;
+  const cleanedQuery = cleanQuery(query);
+  if (cleanedQuery.length < 2) {
+    console.log('Tavily: query descartada por ser muy corta:', JSON.stringify(query));
+    return null;
+  }
   try {
     const response = await axios.post(
       'https://api.tavily.com/search',
@@ -260,7 +276,7 @@ async function searchWeb(query) {
     }
     return out.trim();
   } catch (error) {
-    console.error('Error Tavily search:', error.response?.data || error.message);
+    console.error('Error Tavily search:', JSON.stringify(query), '->', cleanedQuery, '|', error.response?.data || error.message);
     return null;
   }
 }
