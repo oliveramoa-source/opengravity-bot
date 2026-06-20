@@ -150,18 +150,24 @@ TUS ÁREAS DE EXPERTISE:
 7. DESARROLLO DE SOFTWARE: Ayudás en investigación, planificación y diseño de apps.
    Identificás tecnologías, arquitecturas y casos de uso. Generás borradores estructurados.
 
+HERRAMIENTAS DISPONIBLES (vos decidís cuándo usarlas, con criterio propio):
+- buscar_web(query): para cualquier dato que pueda haber cambiado desde tu entrenamiento — cotizaciones, noticias, legislación vigente, jurisprudencia, precios de commodities, mercados internacionales, info de productos/empresas. Usala SIEMPRE que la pregunta dependa de info actual o específica que no tengas con certeza, incluso en preguntas de seguimiento ("compará", "profundizá", "qué cambió") — no esperes a que digan "buscá" explícitamente.
+- leer_url(url): cuando el usuario manda una URL.
+- hora_actual(): para la fecha/hora exacta. Nunca la inventes, siempre usá esta herramienta.
+
+CRITERIO DE ALCANCE GEOGRÁFICO (esto es donde más se nota si tenés criterio real o no):
+- Mariano es abogado argentino: temas de derecho, laboral, impositivo, judicial → alcance Argentina por defecto, salvo que pida otro país.
+- Commodities, mercados financieros internacionales, tecnología, productos para vender globalmente → alcance internacional, NO restrinjas a Argentina solo porque Mariano vive ahí.
+- Si la pregunta es ambigua, usá el contexto de la conversación para decidir el alcance correcto, igual que lo harías si pensaras como un asistente humano experto.
+
 REGLAS:
-- Respondé siempre en español rioplatense
-- Sé directo y sin preámbulos innecesarios
-- Para temas legales: no des asesoramiento vinculante
-- Recordás todo lo que Mariano te contó en conversaciones anteriores
-- NUNCA inventes datos en tiempo real (hora, fecha, cotizaciones, noticias) si no te los proporcionaron explícitamente en el mensaje. Si no tenés el dato, decilo claramente.
-- NUNCA afirmes haber cambiado tu propia voz, velocidad o configuración técnica. Esos cambios los maneja el sistema, no vos. Si te piden cambiar la voz, no respondas nada sobre eso — el sistema ya lo procesó aparte.
-- Respondé exactamente lo que se te pide, sin agregar información no solicitada.
-- NUNCA repitas datos de mensajes anteriores (hora, velocidad, voz, configuración) salvo que te lo pidan explícitamente en el mensaje actual. Cada respuesta se enfoca solo en lo que se pregunta AHORA.
-- Cuando te pidan resumir una URL o sitio web: hacé un resumen breve y propio (3-6 líneas), en tus palabras. Nunca copies bullets o listas textuales del contenido scrapeado sin sintetizar.
-- Respondé SIEMPRE en español, sin mezclar palabras en inglés (ej: no usar "making it" ni anglicismos sueltos).
-- Para temas legales con datos específicos (montos, porcentajes, comparaciones "antes vs. después", artículos de ley): si NO tenés resultados de búsqueda en este mensaje, decí explícitamente "no tengo ese dato verificado, necesito buscarlo" en vez de inventar cifras o comparaciones. Nunca presentes una comparación legal específica como un hecho si no viene de una fuente provista en el contexto.
+- Respondé siempre en español rioplatense, sin mezclar palabras en inglés.
+- Sé directo y sin preámbulos innecesarios. Respondé exactamente lo que se pide, sin agregar info no solicitada.
+- Para temas legales: no des asesoramiento vinculante.
+- Recordás todo lo que Mariano te contó en conversaciones anteriores, pero NUNCA repitas datos de mensajes previos (hora, voz, velocidad, config) salvo que se pregunte por eso específicamente ahora.
+- NUNCA afirmes haber cambiado tu propia voz o velocidad — eso lo maneja el sistema aparte, no respondas nada sobre eso si te lo piden.
+- Cuando resumas una URL o resultado de búsqueda: hacelo en tus propias palabras (3-6 líneas), nunca copies bullets textuales.
+- Para datos específicos (montos, porcentajes, comparaciones "antes vs. después", artículos de ley): si no tenés el dato verificado por una herramienta, decilo explícitamente en vez de inventar cifras. Nunca presentes una comparación legal específica como hecho sin haberla buscado.
 `;
 
 // ─────────────────────────────────────────
@@ -187,11 +193,6 @@ function getArgentinaDateTime() {
 // ─────────────────────────────────────────
 // WEB: BÚSQUEDA + LECTURA DE URLS (Firecrawl)
 // ─────────────────────────────────────────
-function extractUrls(text) {
-  const urlRegex = /https?:\/\/[^\s<>"{}|\\^`\[\]]+/gi;
-  return text.match(urlRegex) || [];
-}
-
 async function scrapeUrl(url) {
   if (!process.env.FIRECRAWL_API_KEY) return null;
   try {
@@ -210,26 +211,6 @@ async function scrapeUrl(url) {
     console.error('Error scraping URL:', error.message);
     return null;
   }
-}
-
-// Normaliza comillas tipográficas (“ ” ‘ ’) a comillas rectas, por si Telegram las autoconvierte
-function normalizeQuotes(text) {
-  return text.replace(/[“”]/g, '"').replace(/[‘’]/g, "'");
-}
-
-// Detecta si un mensaje contiene varias preguntas separadas (numeradas o entre comillas) y las separa
-function splitQueries(rawText) {
-  const text = normalizeQuotes(rawText);
-  const quoted = [...text.matchAll(/"([^"]+)"/g)].map(m => m[1].trim()).filter(s => s.length >= 3);
-  if (quoted.length >= 2) return quoted;
-
-  const numbered = text.split(/\n|(?=\d\s*[\).-])/).map(s => s.trim()).filter(Boolean);
-  const cleaned = numbered
-    .map(s => s.replace(/^\d+\s*[\).-]\s*/, '').replace(/^["']|["']$/g, '').trim())
-    .filter(s => s.length >= 3);
-  if (cleaned.length >= 2) return cleaned;
-
-  return [text];
 }
 
 // Quita verbos/frases de instrucción ("buscá", "investigá", "dame un resumen de") para dejar la query limpia
@@ -296,6 +277,68 @@ async function searchWeb(query) {
 }
 
 // ─────────────────────────────────────────
+// HERRAMIENTAS (function calling) — el modelo decide cuándo y qué buscar
+// ─────────────────────────────────────────
+const TOOL_DEFS = [
+  {
+    type: 'function',
+    function: {
+      name: 'buscar_web',
+      description:
+        'Busca información actualizada en internet (precios, cotizaciones, noticias, legislación vigente, jurisprudencia, commodities, mercados, etc.). ' +
+        'Vos decidís el alcance geográfico según el tema: para derecho/laboral/impositivo/judicial de Mariano (abogado argentino), sumá "Argentina" a la query salvo que se pida otro país explícitamente. ' +
+        'Para commodities, mercados internacionales, tecnología global o productos para vender en el mundo, NO restrinjas a Argentina — buscá con alcance internacional. ' +
+        'Podés llamar esta herramienta varias veces si hay varios temas distintos en un mismo mensaje, pero con 1-2 búsquedas por tema alcanza — no sigas buscando indefinidamente, respondé en cuanto tengas información suficiente.',
+      parameters: {
+        type: 'object',
+        properties: {
+          query: { type: 'string', description: 'La consulta de búsqueda específica y acotada, en español o en el idioma más natural para el tema.' },
+        },
+        required: ['query'],
+      },
+    },
+  },
+  {
+    type: 'function',
+    function: {
+      name: 'leer_url',
+      description: 'Lee y extrae el contenido de una URL específica mencionada por el usuario.',
+      parameters: {
+        type: 'object',
+        properties: { url: { type: 'string', description: 'La URL completa a leer.' } },
+        required: ['url'],
+      },
+    },
+  },
+  {
+    type: 'function',
+    function: {
+      name: 'hora_actual',
+      description: 'Devuelve la fecha y hora exacta actual en Argentina. Usala siempre que te pregunten la hora o fecha — nunca la inventes.',
+      parameters: { type: 'object', properties: {} },
+    },
+  },
+];
+
+const TOOL_HANDLERS = {
+  buscar_web: async ({ query }) => (await searchWeb(query)) || 'Sin resultados relevantes para esta búsqueda.',
+  leer_url: async ({ url }) => (await scrapeUrl(url)) || 'No se pudo leer el contenido de esa URL.',
+  hora_actual: async () => `Hora actual en Argentina: ${getArgentinaDateTime()}`,
+};
+
+async function executeToolCall(toolCall) {
+  const fn = TOOL_HANDLERS[toolCall.function.name];
+  if (!fn) return 'Herramienta no reconocida.';
+  try {
+    const args = JSON.parse(toolCall.function.arguments || '{}');
+    return await fn(args);
+  } catch (error) {
+    console.error(`Error ejecutando ${toolCall.function.name}:`, error.message);
+    return `Error al ejecutar la herramienta: ${error.message}`;
+  }
+}
+
+// ─────────────────────────────────────────
 // CALL AI
 // ─────────────────────────────────────────
 
@@ -304,7 +347,35 @@ function cleanMessages(messages) {
   return messages.map(m => ({ role: m.role, content: m.content }));
 }
 
-async function callAI(messages, config) {
+// Llama al endpoint OpenAI-compatible con soporte de tool-calling, resolviendo hasta 2 rondas de herramientas
+async function chatWithTools(url, apiKey, model, messages, onToolNotice) {
+  const headers = { 'Content-Type': 'application/json', Authorization: `Bearer ${apiKey}` };
+  let convo = [...messages];
+
+  for (let round = 0; round < 5; round++) {
+    const response = await axios.post(
+      url,
+      { model, messages: convo, temperature: 0.5, tools: TOOL_DEFS, tool_choice: 'auto' },
+      { headers, timeout: 30000 }
+    );
+    const msg = response.data.choices[0].message;
+
+    if (!msg.tool_calls || !msg.tool_calls.length) {
+      return msg.content;
+    }
+
+    if (onToolNotice) await onToolNotice(msg.tool_calls);
+
+    convo.push({ role: 'assistant', content: msg.content || null, tool_calls: msg.tool_calls });
+    for (const tc of msg.tool_calls) {
+      const result = await executeToolCall(tc);
+      convo.push({ role: 'tool', tool_call_id: tc.id, content: String(result).slice(0, 4000) });
+    }
+  }
+  return 'No pude completar la respuesta tras varias búsquedas. Probá reformular la pregunta.';
+}
+
+async function callAI(messages, config, onToolNotice) {
   const headers = { 'Content-Type': 'application/json' };
   const provider = config?.provider || 'groq';
   const model = config?.model || 'llama-3.3-70b-versatile';
@@ -312,13 +383,7 @@ async function callAI(messages, config) {
 
   if (provider === 'groq' && process.env.GROQ_API_KEY) {
     try {
-      headers['Authorization'] = `Bearer ${process.env.GROQ_API_KEY}`;
-      const response = await axios.post(
-        'https://api.groq.com/openai/v1/chat/completions',
-        { model, messages: clean, temperature: 0.7 },
-        { headers, timeout: 30000 }
-      );
-      return response.data.choices[0].message.content;
+      return await chatWithTools('https://api.groq.com/openai/v1/chat/completions', process.env.GROQ_API_KEY, model, clean, onToolNotice);
     } catch (error) {
       console.error('Error Groq:', error.response?.data?.error?.message || error.message);
     }
@@ -326,13 +391,7 @@ async function callAI(messages, config) {
 
   if (provider === 'openrouter' && process.env.OPENROUTER_API_KEY) {
     try {
-      headers['Authorization'] = `Bearer ${process.env.OPENROUTER_API_KEY}`;
-      const response = await axios.post(
-        'https://openrouter.ai/api/v1/chat/completions',
-        { model, messages: clean },
-        { headers, timeout: 30000 }
-      );
-      return response.data.choices[0].message.content;
+      return await chatWithTools('https://openrouter.ai/api/v1/chat/completions', process.env.OPENROUTER_API_KEY, model, clean, onToolNotice);
     } catch (error) { console.error('Error OpenRouter:', error.message); }
   }
 
@@ -353,25 +412,13 @@ async function callAI(messages, config) {
   // Fallback final: Groq con modelo estable
   if (process.env.GROQ_API_KEY) {
     try {
-      headers['Authorization'] = `Bearer ${process.env.GROQ_API_KEY}`;
-      const response = await axios.post(
-        'https://api.groq.com/openai/v1/chat/completions',
-        { model: 'llama-3.3-70b-versatile', messages: clean, temperature: 0.7 },
-        { headers, timeout: 30000 }
-      );
-      return response.data.choices[0].message.content;
+      return await chatWithTools('https://api.groq.com/openai/v1/chat/completions', process.env.GROQ_API_KEY, 'llama-3.3-70b-versatile', clean, onToolNotice);
     } catch (error) { console.error('Error fallback Groq:', error.message); }
   }
 
   if (process.env.OPENROUTER_API_KEY) {
     try {
-      headers['Authorization'] = `Bearer ${process.env.OPENROUTER_API_KEY}`;
-      const response = await axios.post(
-        'https://openrouter.ai/api/v1/chat/completions',
-        { model: 'meta-llama/llama-3.1-8b-instruct', messages: clean },
-        { headers, timeout: 30000 }
-      );
-      return response.data.choices[0].message.content;
+      return await chatWithTools('https://openrouter.ai/api/v1/chat/completions', process.env.OPENROUTER_API_KEY, 'meta-llama/llama-3.1-8b-instruct', clean, onToolNotice);
     } catch (error) { console.error('Error fallback OpenRouter:', error.message); }
   }
 
@@ -708,65 +755,27 @@ async function handleUserText(ctx, text) {
     );
   }
 
+  // ── Todo lo demás: el modelo decide con criterio si busca, qué busca y con qué alcance ──
   const config = await getConfig(userId);
   const history = await getHistory(userId);
-  let extraContext = '';
 
-  // ── Lectura de URLs en el mensaje ──
-  const urls = extractUrls(text);
-  if (urls.length > 0 && process.env.FIRECRAWL_API_KEY) {
-    await ctx.reply('🌐 Leyendo el enlace...');
-    for (const url of urls.slice(0, 2)) {
-      const content = await scrapeUrl(url);
-      if (content) extraContext += `\n\n${content}`;
-    }
-  }
-
-  // ── Búsqueda web proactiva (incluye pedidos de seguimiento/profundización) ──
-  const searchKeywords = ['buscá', 'busca', 'buscame', 'investigá', 'investiga', 'precio de', 'cotización',
-    'noticias', 'últimas noticias', 'qué pasó', 'que paso'];
-  const followUpKeywords = ['compará', 'compara', 'comparame', 'diferencia', 'qué cambió', 'que cambio',
-    'cómo era antes', 'como era antes', 'profundizá', 'profundiza', 'explicá más', 'explica mas',
-    'detalle', 'detallame', 'ampliá', 'amplia', 'amplíame', 'ampliame', 'más información', 'mas informacion'];
-
-  const explicitSearch = searchKeywords.some(k => text.toLowerCase().includes(k));
-  const isFollowUp = followUpKeywords.some(k => text.toLowerCase().includes(k));
-
-  // Búsqueda "pegajosa": si el mensaje anterior del bot incluyó búsqueda web reciente,
-  // un pedido de profundización also dispara nueva búsqueda usando el tema anterior + lo nuevo.
-  let stickyTopic = null;
-  if (isFollowUp && !explicitSearch) {
-    const ttsCfgForSticky = await getConfig(userId);
-    const lastTopic = ttsCfgForSticky.lastSearchTopic;
-    const lastAt = ttsCfgForSticky.lastSearchAt ? new Date(ttsCfgForSticky.lastSearchAt).getTime() : 0;
-    if (lastTopic && Date.now() - lastAt < 15 * 60 * 1000) stickyTopic = lastTopic;
-  }
-
-  const isSearch = !urls.length && (explicitSearch || isFollowUp);
-
-  if (isSearch && process.env.TAVILY_API_KEY) {
-    await ctx.reply('🔍 Buscando en la web...');
-    const baseText = stickyTopic ? `${stickyTopic} — ${text}` : text;
-    const queries = splitQueries(baseText).slice(0, 4);
-    for (const q of queries) {
-      const results = await searchWeb(q);
-      if (results) extraContext += `\n\nResultados para "${q}":\n${results}`;
-    }
-    // Guarda el tema para sostener la búsqueda en próximos mensajes de seguimiento
-    await saveConfig(userId, { lastSearchTopic: text.slice(0, 200), lastSearchAt: new Date().toISOString() });
-  }
-
-  // ── Construcción del prompt y respuesta ──
-  const userContent = extraContext
-    ? `${text}\n\n⚠️ IMPORTANTE: Tenés los siguientes datos obtenidos en tiempo real. USÁ ESTA INFORMACIÓN para responder con los datos concretos que encontraste, sintetizando en tus propias palabras (no copies bullets textuales). No digas que no tenés acceso a info en tiempo real. No menciones hora, voz ni velocidad salvo que se pregunte por eso específicamente.\n${extraContext}`
-    : text;
   await saveMessage(userId, 'user', text);
   const messages = [
     { role: 'system', content: SYSTEM_PROMPT },
     ...history,
-    { role: 'user', content: userContent },
+    { role: 'user', content: text },
   ];
-  const aiReply = await callAI(messages, config);
+
+  let notified = false;
+  const onToolNotice = async (toolCalls) => {
+    if (notified) return;
+    notified = true;
+    const names = toolCalls.map(tc => tc.function.name);
+    if (names.includes('buscar_web')) await ctx.reply('🔍 Buscando en la web...');
+    else if (names.includes('leer_url')) await ctx.reply('🌐 Leyendo el enlace...');
+  };
+
+  const aiReply = await callAI(messages, config, onToolNotice);
   await saveMessage(userId, 'assistant', aiReply);
   await replyWithAudio(ctx, aiReply);
 }
