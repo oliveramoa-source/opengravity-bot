@@ -6,6 +6,6 @@
   "deploy": {
     "startCommand": "npm start",
     "restartPolicyType": "always",
-    "restartPolicyMaxRetries": 5
+    "restartPolicyMaxRetries": 10
   }
 }
