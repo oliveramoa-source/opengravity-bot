@@ -418,7 +418,7 @@ async function callAI(messages, config, onToolNotice) {
 
   if (process.env.OPENROUTER_API_KEY) {
     try {
-      return await chatWithTools('https://openrouter.ai/api/v1/chat/completions', process.env.OPENROUTER_API_KEY, 'meta-llama/llama-3.1-8b-instruct', clean, onToolNotice);
+      return await chatWithTools('https://openrouter.ai/api/v1/chat/completions', process.env.OPENROUTER_API_KEY, 'meta-llama/llama-3.1-8b-instruct:free', clean, onToolNotice);
     } catch (error) { console.error('Error fallback OpenRouter:', error.message); }
   }
 
