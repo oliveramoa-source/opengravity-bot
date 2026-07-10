@@ -416,6 +416,14 @@ async function callAI(messages, config, onToolNotice) {
     } catch (error) { console.error('Error fallback Groq:', error.message); }
   }
 
+  // Fallback de razonamiento: modelo gratuito fuerte en derecho/finanzas/marketing (ranking OpenRouter jul-2026)
+  if (process.env.OPENROUTER_API_KEY) {
+    try {
+      return await chatWithTools('https://openrouter.ai/api/v1/chat/completions', process.env.OPENROUTER_API_KEY, 'tencent/hy3:free', clean, onToolNotice);
+    } catch (error) { console.error('Error fallback Hy3:', error.message); }
+  }
+
+  // Último recurso: modelo chico y liviano, casi siempre disponible
   if (process.env.OPENROUTER_API_KEY) {
     try {
       return await chatWithTools('https://openrouter.ai/api/v1/chat/completions', process.env.OPENROUTER_API_KEY, 'meta-llama/llama-3.1-8b-instruct:free', clean, onToolNotice);
@@ -535,6 +543,8 @@ function parseConfigCommand(text) {
     'qwen': 'qwen/qwen-2.5-72b-instruct:free',
     'qwen3:4b': 'qwen3:4b',
     'qwen3:8b': 'qwen3:8b',
+    'hy3': 'tencent/hy3:free',
+    'glm': 'z-ai/glm-4.5-air:free',
   };
 
   for (const [key, val] of Object.entries(models)) {
