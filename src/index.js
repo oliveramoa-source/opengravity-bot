@@ -138,7 +138,7 @@ TUS ÁREAS DE EXPERTISE:
    análisis de mercados, proveedores, precios internacionales, logística.
 
 4. INTELIGENCIA ARTIFICIAL: Conocés todo el ecosistema Metatrón de Mariano.
-   Plataformas: Claude, Gemini, GPT, Groq, OpenRouter, Ollama, NotebookLM.
+   Plataformas: Claude, Gemini, GPT, Groq, OpenRouter, NotebookLM.
    Podés ayudar a diseñar agentes, prompts, automatizaciones y flujos de trabajo.
 
 5. NEGOCIOS Y EMPRENDIMIENTO: Planes de negocio, análisis de viabilidad, estrategia,
@@ -180,6 +180,13 @@ function isTimeQuery(text) {
   return TIME_KEYWORDS.some(k => t.includes(k));
 }
 
+// Detecta preguntas tipo "¿con qué proveedor/modelo estás funcionando?" — se responde leyendo Firestore directo, sin llamar a la IA
+function isConfigQuery(text) {
+  const t = text.toLowerCase();
+  return /\bcon\s+qu[eé]\s+(proveedor|modelo|ia)\b/.test(t) ||
+    /\bqu[eé]\s+(proveedor|modelo|ia)\b.*\b(est[aá]s?|and[aá]s?|usa[sn]?|funcionando)\b/.test(t);
+}
+
 function getArgentinaDateTime() {
   const now = new Date();
   const formatter = new Intl.DateTimeFormat('es-AR', {
@@ -209,7 +216,7 @@ async function scrapeUrl(url) {
     return `📄 *Contenido de ${url}:*\n\n${md.slice(0, 2000)}`;
   } catch (error) {
     console.error('Error scraping URL:', error.message);
-    return null;
+    throw new Error('FIRECRAWL_UNAVAILABLE');
   }
 }
 
@@ -272,7 +279,7 @@ async function searchWeb(query) {
     return out.trim();
   } catch (error) {
     console.error('Error Tavily search:', JSON.stringify(query), '->', cleanedQuery, '|', error.response?.data || error.message);
-    return null;
+    throw new Error('TAVILY_UNAVAILABLE');
   }
 }
 
@@ -321,8 +328,20 @@ const TOOL_DEFS = [
 ];
 
 const TOOL_HANDLERS = {
-  buscar_web: async ({ query }) => (await searchWeb(query)) || 'Sin resultados relevantes para esta búsqueda.',
-  leer_url: async ({ url }) => (await scrapeUrl(url)) || 'No se pudo leer el contenido de esa URL.',
+  buscar_web: async ({ query }) => {
+    try {
+      return (await searchWeb(query)) || 'Sin resultados relevantes para esta búsqueda.';
+    } catch (error) {
+      return 'No pude acceder a la búsqueda web en este momento.';
+    }
+  },
+  leer_url: async ({ url }) => {
+    try {
+      return (await scrapeUrl(url)) || 'No se pudo leer el contenido de esa URL.';
+    } catch (error) {
+      return 'No pude leer esa URL en este momento.';
+    }
+  },
   hora_actual: async () => `Hora actual en Argentina: ${getArgentinaDateTime()}`,
 };
 
@@ -375,37 +394,38 @@ async function chatWithTools(url, apiKey, model, messages, onToolNotice) {
   return 'No pude completar la respuesta tras varias búsquedas. Probá reformular la pregunta.';
 }
 
-async function callAI(messages, config, onToolNotice) {
+// Guarda en Firestore el detalle de qué proveedor/modelo falló y por qué, para diagnosticar sin adivinar
+async function logAIFailure(userId, attempts) {
+  try {
+    await db.collection('ai_errors').add({ userId: String(userId || 'unknown'), attempts, timestamp: new Date().toISOString() });
+  } catch (error) {
+    console.error('Error guardando log de fallos de IA:', error.message);
+  }
+}
+
+async function callAI(messages, config, onToolNotice, userId) {
   const headers = { 'Content-Type': 'application/json' };
   const provider = config?.provider || 'groq';
   const model = config?.model || 'llama-3.3-70b-versatile';
   const clean = cleanMessages(messages);
+  const attempts = [];
 
   if (provider === 'groq' && process.env.GROQ_API_KEY) {
     try {
       return await chatWithTools('https://api.groq.com/openai/v1/chat/completions', process.env.GROQ_API_KEY, model, clean, onToolNotice);
     } catch (error) {
-      console.error('Error Groq:', error.response?.data?.error?.message || error.message);
+      const detail = error.response?.data?.error?.message || error.message;
+      console.error('Error Groq:', detail);
+      attempts.push({ provider: 'groq', model, error: detail });
     }
   }
 
   if (provider === 'openrouter' && process.env.OPENROUTER_API_KEY) {
     try {
       return await chatWithTools('https://openrouter.ai/api/v1/chat/completions', process.env.OPENROUTER_API_KEY, model, clean, onToolNotice);
-    } catch (error) { console.error('Error OpenRouter:', error.message); }
-  }
-
-  if (provider === 'ollama') {
-    const ollamaUrl = process.env.OLLAMA_URL || 'http://localhost:11434';
-    try {
-      const response = await axios.post(
-        `${ollamaUrl}/api/chat`,
-        { model: model || 'qwen3:4b', messages: clean, stream: false },
-        { timeout: 120000 }
-      );
-      return response.data.message?.content;
     } catch (error) {
-      console.error('Error Ollama:', error.message);
+      console.error('Error OpenRouter:', error.message);
+      attempts.push({ provider: 'openrouter', model, error: error.message });
     }
   }
 
@@ -413,23 +433,33 @@ async function callAI(messages, config, onToolNotice) {
   if (process.env.GROQ_API_KEY) {
     try {
       return await chatWithTools('https://api.groq.com/openai/v1/chat/completions', process.env.GROQ_API_KEY, 'llama-3.3-70b-versatile', clean, onToolNotice);
-    } catch (error) { console.error('Error fallback Groq:', error.message); }
+    } catch (error) {
+      console.error('Error fallback Groq:', error.message);
+      attempts.push({ provider: 'groq', model: 'llama-3.3-70b-versatile', error: error.message });
+    }
   }
 
   // Fallback de razonamiento: modelo gratuito fuerte en derecho/finanzas/marketing (ranking OpenRouter jul-2026)
   if (process.env.OPENROUTER_API_KEY) {
     try {
       return await chatWithTools('https://openrouter.ai/api/v1/chat/completions', process.env.OPENROUTER_API_KEY, 'tencent/hy3:free', clean, onToolNotice);
-    } catch (error) { console.error('Error fallback Hy3:', error.message); }
+    } catch (error) {
+      console.error('Error fallback Hy3:', error.message);
+      attempts.push({ provider: 'openrouter', model: 'tencent/hy3:free', error: error.message });
+    }
   }
 
   // Último recurso: modelo chico y liviano, casi siempre disponible
   if (process.env.OPENROUTER_API_KEY) {
     try {
       return await chatWithTools('https://openrouter.ai/api/v1/chat/completions', process.env.OPENROUTER_API_KEY, 'meta-llama/llama-3.1-8b-instruct:free', clean, onToolNotice);
-    } catch (error) { console.error('Error fallback OpenRouter:', error.message); }
+    } catch (error) {
+      console.error('Error fallback OpenRouter:', error.message);
+      attempts.push({ provider: 'openrouter', model: 'meta-llama/llama-3.1-8b-instruct:free', error: error.message });
+    }
   }
 
+  await logAIFailure(userId, attempts);
   return 'Lo siento, no hay servicios de IA disponibles en este momento.';
 }
 
@@ -521,6 +551,83 @@ async function transcribeAudio(fileUrl) {
 }
 
 // ─────────────────────────────────────────
+// DOCUMENTOS: PDF / WORD (.docx) — descarga, extracción de texto, resumen
+// ─────────────────────────────────────────
+const MAX_DOCUMENT_BYTES = 20 * 1024 * 1024; // límite de descarga de la Bot API de Telegram
+const SUPPORTED_DOCUMENT_EXT = ['.pdf', '.docx'];
+
+function getDocumentExtension(fileName) {
+  const match = /\.[^.]+$/.exec(fileName || '');
+  return match ? match[0].toLowerCase() : '';
+}
+
+async function extractPdfText(buffer) {
+  const pdfParse = require('pdf-parse');
+  const data = await pdfParse(buffer);
+  return data.text;
+}
+
+async function extractDocxText(buffer) {
+  const mammoth = require('mammoth');
+  const result = await mammoth.extractRawText({ buffer });
+  return result.value;
+}
+
+// ─────────────────────────────────────────
+// CATÁLOGO DE PROVEEDORES/MODELOS (fuente de verdad para validación y mensajes al usuario)
+// ─────────────────────────────────────────
+const MODELS_BY_PROVIDER = {
+  groq: {
+    default: 'llama-3.3-70b-versatile',
+    models: {
+      'llama-3.3-70b-versatile': 'Default — modelo principal, más capaz, uso general',
+      'llama-3.1-8b-instant': 'Rápido, para tareas simples/livianas',
+      'gemma2-9b-it': 'Alternativa liviana de Google',
+      'mixtral-8x7b-32768': 'Contexto largo',
+    },
+  },
+  openrouter: {
+    default: 'meta-llama/llama-3.1-8b-instruct:free',
+    models: {
+      'tencent/hy3:free': 'Fallback de razonamiento (uso interno del sistema)',
+      'meta-llama/llama-3.1-8b-instruct:free': 'Último recurso del sistema',
+      'deepseek/deepseek-r1:free': 'Razonamiento profundo/matemático',
+      'mistralai/mistral-7b-instruct:free': 'Liviano y rápido',
+      'qwen/qwen-2.5-72b-instruct:free': 'Modelo grande, multilingüe',
+      'z-ai/glm-4.5-air:free': 'GLM, uso general',
+    },
+  },
+};
+
+function isValidModelForProvider(provider, model) {
+  return !!MODELS_BY_PROVIDER[provider]?.models[model];
+}
+
+const PROVIDER_LABELS = { groq: 'Groq', openrouter: 'OpenRouter' };
+
+function formatModelCatalog() {
+  return `⚠️ Esa combinación no es válida.\nProveedores y modelos disponibles:\n\n${buildModelCatalogText()}`;
+}
+
+// Texto plano del catálogo, reutilizado en el mensaje de error y en el system prompt (para que el modelo pueda recomendar el más adecuado según la tarea)
+function buildModelCatalogText() {
+  let out = '';
+  for (const [provider, info] of Object.entries(MODELS_BY_PROVIDER)) {
+    out += `• ${PROVIDER_LABELS[provider]}\n`;
+    for (const [model, desc] of Object.entries(info.models)) {
+      out += `  - \`${model}\` — ${desc}\n`;
+    }
+  }
+  return out.trim();
+}
+
+// System prompt completo: base + catálogo de modelos, para que el modelo pueda recomendar el más adecuado si le preguntan
+const SYSTEM_PROMPT_FULL = `${SYSTEM_PROMPT}
+
+CATÁLOGO DE MODELOS DISPONIBLES (si te preguntan qué modelo conviene para una tarea, respondé con criterio usando esta info):
+${buildModelCatalogText()}`;
+
+// ─────────────────────────────────────────
 // PARSEO DE COMANDOS DE CONFIGURACIÓN
 // ─────────────────────────────────────────
 function parseConfigCommand(text) {
@@ -530,7 +637,6 @@ function parseConfigCommand(text) {
 
   if (t.includes('groq')) provider = 'groq';
   else if (t.includes('openrouter')) provider = 'openrouter';
-  else if (t.includes('ollama')) provider = 'ollama';
 
   const models = {
     'llama-3.3-70b': 'llama-3.3-70b-versatile',
@@ -541,8 +647,6 @@ function parseConfigCommand(text) {
     'deepseek': 'deepseek/deepseek-r1:free',
     'mistral': 'mistralai/mistral-7b-instruct:free',
     'qwen': 'qwen/qwen-2.5-72b-instruct:free',
-    'qwen3:4b': 'qwen3:4b',
-    'qwen3:8b': 'qwen3:8b',
     'hy3': 'tencent/hy3:free',
     'glm': 'z-ai/glm-4.5-air:free',
   };
@@ -586,6 +690,25 @@ function parseVoiceCommand(text) {
   if (!voice && !speed) return null;
   return { voice, speed };
 }
+
+// ─────────────────────────────────────────
+// CAPTURA DE IDEAS DESDE CONVERSACIÓN NATURAL (con confirmación previa — nunca se guarda directo)
+// ─────────────────────────────────────────
+const IDEA_KEYWORDS = ['se me ocurre', 'podría ser una idea', 'podria ser una idea', 'sería una idea', 'seria una idea',
+  'para el ecosistema', 'para metatrón', 'para metatron', 'buena idea para', 'tengo una idea'];
+
+function isPossibleIdea(text) {
+  const t = text.toLowerCase();
+  return IDEA_KEYWORDS.some(k => t.includes(k));
+}
+
+function isAffirmative(text) {
+  // (?=\s|$|[,.!¿¡?]) en vez de \b: \b no detecta límite de palabra después de una vocal acentuada (sí, dale) en JS
+  return /^\s*(s[ií]|dale|obvio|claro|okay?|de\s+una)(?=\s|$|[,.!¿¡?])/i.test(text.trim());
+}
+
+// Guarda, por usuario, la idea detectada mientras se espera su confirmación (sí/no). En memoria: es efímero, no necesita Firestore.
+const pendingIdeas = new Map();
 
 // ─────────────────────────────────────────
 // COMANDOS
@@ -679,16 +802,21 @@ bot.command('buscar', async (ctx) => {
   if (!query) return ctx.reply('Escribí qué querés buscar:\n`/buscar [consulta]`', { parse_mode: 'Markdown' });
   await ctx.sendChatAction('typing');
   await ctx.reply(`🔍 Buscando: "${query}"...`);
-  const results = await searchWeb(query);
+  let results;
+  try {
+    results = await searchWeb(query);
+  } catch (error) {
+    return ctx.reply('No pude acceder a la búsqueda web en este momento.');
+  }
   if (!results) return ctx.reply('No encontré resultados.');
   const config = await getConfig(ctx.from.id);
   const history = await getHistory(ctx.from.id);
   const messages = [
-    { role: 'system', content: SYSTEM_PROMPT },
+    { role: 'system', content: SYSTEM_PROMPT_FULL },
     ...history,
     { role: 'user', content: `${query}\n\nResultados web:\n${results}` },
   ];
-  const aiReply = await callAI(messages, config);
+  const aiReply = await callAI(messages, config, null, ctx.from.id);
   await saveMessage(ctx.from.id, 'user', `/buscar ${query}`);
   await saveMessage(ctx.from.id, 'assistant', aiReply);
   await replyWithAudio(ctx, aiReply);
@@ -720,10 +848,30 @@ async function replyWithAudio(ctx, text) {
 async function handleUserText(ctx, text) {
   const userId = ctx.from.id;
 
+  // ── Confirmación pendiente de una idea detectada en el mensaje anterior ──
+  if (pendingIdeas.has(userId)) {
+    const ideaText = pendingIdeas.get(userId);
+    pendingIdeas.delete(userId);
+    if (isAffirmative(text)) {
+      const id = await saveIdea(userId, ideaText);
+      return ctx.reply(`💡 Idea guardada (ID: ${id}).`);
+    }
+    return ctx.reply('Dale, no la guardo.');
+  }
+
   // ── Hora/fecha exacta — cálculo directo, sin inventar nada ──
   if (isTimeQuery(text)) {
     const datetime = getArgentinaDateTime();
     const reply = `🕐 En Argentina son las: *${datetime}*`;
+    await saveMessage(userId, 'user', text);
+    await saveMessage(userId, 'assistant', reply);
+    return replyWithAudio(ctx, reply);
+  }
+
+  // ── Consulta de la config vigente — lectura directa de Firestore, sin tocar la IA ──
+  if (isConfigQuery(text)) {
+    const config = await getConfig(userId);
+    const reply = `⚙️ Estoy funcionando con:\n• Provider: *${config.provider}*\n• Modelo: *${config.model}*`;
     await saveMessage(userId, 'user', text);
     await saveMessage(userId, 'assistant', reply);
     return replyWithAudio(ctx, reply);
@@ -752,17 +900,35 @@ async function handleUserText(ctx, text) {
   // ── Cambio de configuración por lenguaje natural ──
   const configKeywords = ['cambiá', 'cambia', 'usá', 'usa', 'cambiame', 'cambiar', 'pasá', 'pasa'];
   const isConfig = configKeywords.some(k => text.toLowerCase().includes(k)) &&
-    ['groq', 'openrouter', 'ollama', 'modelo'].some(k => text.toLowerCase().includes(k));
+    ['groq', 'openrouter', 'modelo'].some(k => text.toLowerCase().includes(k));
 
   if (isConfig) {
     const { provider, model } = parseConfigCommand(text);
     const current = await getConfig(userId);
-    const newConfig = { provider: provider || current.provider, model: model || current.model };
+    const newProvider = provider || current.provider;
+    let newModel = model || current.model;
+
+    if (!isValidModelForProvider(newProvider, newModel)) {
+      if (provider && !model) {
+        // Cambio de proveedor sin modelo explícito: el modelo heredado no aplica, reseteamos al default (cambio válido implícito, no un error)
+        newModel = MODELS_BY_PROVIDER[newProvider].default;
+      } else {
+        return ctx.reply(formatModelCatalog(), { parse_mode: 'Markdown' });
+      }
+    }
+
+    const newConfig = { provider: newProvider, model: newModel };
     await saveConfig(userId, newConfig);
     return ctx.reply(
       `✅ *Configuración actualizada:*\n\n• Provider: \`${newConfig.provider}\`\n• Modelo: \`${newConfig.model}\``,
       { parse_mode: 'Markdown' }
     );
+  }
+
+  // ── Posible idea nueva detectada en lenguaje natural — nunca se guarda directo, siempre se pregunta primero ──
+  if (isPossibleIdea(text)) {
+    pendingIdeas.set(userId, text);
+    return ctx.reply('💡 ¿Guardo esto como idea? (sí/no)');
   }
 
   // ── Todo lo demás: el modelo decide con criterio si busca, qué busca y con qué alcance ──
@@ -771,7 +937,7 @@ async function handleUserText(ctx, text) {
 
   await saveMessage(userId, 'user', text);
   const messages = [
-    { role: 'system', content: SYSTEM_PROMPT },
+    { role: 'system', content: SYSTEM_PROMPT_FULL },
     ...history,
     { role: 'user', content: text },
   ];
@@ -785,7 +951,7 @@ async function handleUserText(ctx, text) {
     else if (names.includes('leer_url')) await ctx.reply('🌐 Leyendo el enlace...');
   };
 
-  const aiReply = await callAI(messages, config, onToolNotice);
+  const aiReply = await callAI(messages, config, onToolNotice, userId);
   await saveMessage(userId, 'assistant', aiReply);
   await replyWithAudio(ctx, aiReply);
 }
@@ -812,6 +978,61 @@ bot.on('voice', async (ctx) => {
   } catch (error) {
     console.error('Error en voice:', error);
     ctx.reply('Ocurrió un error procesando tu audio.');
+  }
+});
+
+// ─────────────────────────────────────────
+// DOCUMENTOS (PDF / DOCX)
+// ─────────────────────────────────────────
+bot.on('document', async (ctx) => {
+  const userId = ctx.from.id;
+  const doc = ctx.message.document;
+  const fileName = doc.file_name || 'documento';
+  const ext = getDocumentExtension(fileName);
+  let tempPath = null;
+
+  if (!SUPPORTED_DOCUMENT_EXT.includes(ext)) {
+    return ctx.reply(`❌ Formato no soportado (${ext || 'sin extensión'}). Por ahora solo puedo leer PDF y Word (.docx).`);
+  }
+  if (doc.file_size && doc.file_size > MAX_DOCUMENT_BYTES) {
+    return ctx.reply('❌ El archivo es demasiado grande (límite: 20MB).');
+  }
+
+  await ctx.sendChatAction('typing');
+  try {
+    await ctx.reply(`📄 Procesando "${fileName}"...`);
+    const file = await ctx.telegram.getFile(doc.file_id);
+    const fileUrl = `https://api.telegram.org/file/bot${process.env.TELEGRAM_BOT_TOKEN}/${file.file_path}`;
+    const response = await axios.get(fileUrl, { responseType: 'arraybuffer' });
+    tempPath = path.join(__dirname, `doc_${Date.now()}${ext}`);
+    fs.writeFileSync(tempPath, response.data);
+
+    const buffer = fs.readFileSync(tempPath);
+    const text = ext === '.pdf' ? await extractPdfText(buffer) : await extractDocxText(buffer);
+
+    if (!text || !text.trim()) {
+      return ctx.reply('❌ No pude extraer texto de ese documento (puede estar escaneado como imagen o vacío).');
+    }
+
+    const config = await getConfig(userId);
+    const history = await getHistory(userId);
+    const userPrompt = `Resumí los puntos clave de este documento ("${fileName}"):\n\n${text.slice(0, 8000)}`;
+    const messages = [
+      { role: 'system', content: SYSTEM_PROMPT_FULL },
+      ...history,
+      { role: 'user', content: userPrompt },
+    ];
+    const aiReply = await callAI(messages, config, null, userId);
+    await saveMessage(userId, 'user', `[documento] ${fileName}`);
+    await saveMessage(userId, 'assistant', aiReply);
+    await replyWithAudio(ctx, aiReply);
+  } catch (error) {
+    console.error('Error procesando documento:', error.message);
+    await ctx.reply('❌ No pude procesar ese documento en este momento.');
+  } finally {
+    if (tempPath) {
+      try { fs.unlinkSync(tempPath); } catch (_) {}
+    }
   }
 });
 
