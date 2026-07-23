@@ -403,12 +403,35 @@ async function logAIFailure(userId, attempts) {
   }
 }
 
+// Clasifica el motivo de una falla de IA para que quede diferenciado en ai_errors sin tener que leer la consola.
+// "modelo_retirado" cubre tanto el 404 típico de un modelo que el proveedor sacó del catálogo como el mensaje
+// "does not exist" que devuelve Groq cuando el modelo pedido pertenece a otro proveedor.
+function classifyAIError(error) {
+  const status = error.response?.status;
+  const message = error.response?.data?.error?.message || error.message || '';
+  if (status === 404 || /does not exist|not found|deprecated|no longer available/i.test(message)) return 'modelo_retirado';
+  if (status === 401 || status === 403) return 'auth_invalida';
+  if (status === 429) return 'rate_limit';
+  if (status === 400) return 'request_invalida';
+  return 'error_desconocido';
+}
+
 async function callAI(messages, config, onToolNotice, userId) {
   const headers = { 'Content-Type': 'application/json' };
-  const provider = config?.provider || 'groq';
-  const model = config?.model || 'llama-3.3-70b-versatile';
+  let provider = config?.provider || 'groq';
+  let model = config?.model || MODELS_BY_PROVIDER.groq.default;
   const clean = cleanMessages(messages);
   const attempts = [];
+
+  // Chequeo de sanidad: si la combinación guardada quedó inválida (proveedor desconocido o modelo
+  // retirado/inexistente en el catálogo), resetear al default del proveedor ANTES de llamar a la API,
+  // en vez de intentar con datos que sabemos que van a fallar. Se persiste para que la próxima consulta
+  // ya arranque con una config sana.
+  if (!MODELS_BY_PROVIDER[provider]) provider = 'groq';
+  if (!isValidModelForProvider(provider, model)) {
+    model = MODELS_BY_PROVIDER[provider].default;
+    if (userId) saveConfig(userId, { provider, model }).catch(() => {});
+  }
 
   if (provider === 'groq' && process.env.GROQ_API_KEY) {
     try {
@@ -416,7 +439,7 @@ async function callAI(messages, config, onToolNotice, userId) {
     } catch (error) {
       const detail = error.response?.data?.error?.message || error.message;
       console.error('Error Groq:', detail);
-      attempts.push({ provider: 'groq', model, error: detail });
+      attempts.push({ provider: 'groq', model, error: detail, reason: classifyAIError(error) });
     }
   }
 
@@ -424,8 +447,9 @@ async function callAI(messages, config, onToolNotice, userId) {
     try {
       return await chatWithTools('https://openrouter.ai/api/v1/chat/completions', process.env.OPENROUTER_API_KEY, model, clean, onToolNotice);
     } catch (error) {
-      console.error('Error OpenRouter:', error.message);
-      attempts.push({ provider: 'openrouter', model, error: error.message });
+      const detail = error.response?.data?.error?.message || error.message;
+      console.error('Error OpenRouter:', detail);
+      attempts.push({ provider: 'openrouter', model, error: detail, reason: classifyAIError(error) });
     }
   }
 
@@ -434,28 +458,34 @@ async function callAI(messages, config, onToolNotice, userId) {
     try {
       return await chatWithTools('https://api.groq.com/openai/v1/chat/completions', process.env.GROQ_API_KEY, 'llama-3.3-70b-versatile', clean, onToolNotice);
     } catch (error) {
-      console.error('Error fallback Groq:', error.message);
-      attempts.push({ provider: 'groq', model: 'llama-3.3-70b-versatile', error: error.message });
+      const detail = error.response?.data?.error?.message || error.message;
+      console.error('Error fallback Groq:', detail);
+      attempts.push({ provider: 'groq', model: 'llama-3.3-70b-versatile', error: detail, reason: classifyAIError(error) });
     }
   }
 
-  // Fallback de razonamiento: modelo gratuito fuerte en derecho/finanzas/marketing (ranking OpenRouter jul-2026)
-  if (process.env.OPENROUTER_API_KEY) {
+  // Fallback de razonamiento: modelo gratuito de OpenRouter, chico y liviano, distinto del default de arriba
+  // (evita reintentar el mismo modelo dos veces si el usuario ya estaba en 'openrouter').
+  const alreadyTried = (p, m) => attempts.some(a => a.provider === p && a.model === m) || (provider === p && model === m);
+  if (process.env.OPENROUTER_API_KEY && !alreadyTried('openrouter', 'nvidia/nemotron-3-nano-30b-a3b:free')) {
     try {
-      return await chatWithTools('https://openrouter.ai/api/v1/chat/completions', process.env.OPENROUTER_API_KEY, 'tencent/hy3:free', clean, onToolNotice);
+      return await chatWithTools('https://openrouter.ai/api/v1/chat/completions', process.env.OPENROUTER_API_KEY, 'nvidia/nemotron-3-nano-30b-a3b:free', clean, onToolNotice);
     } catch (error) {
-      console.error('Error fallback Hy3:', error.message);
-      attempts.push({ provider: 'openrouter', model: 'tencent/hy3:free', error: error.message });
+      const detail = error.response?.data?.error?.message || error.message;
+      console.error('Error fallback Nemotron-nano:', detail);
+      attempts.push({ provider: 'openrouter', model: 'nvidia/nemotron-3-nano-30b-a3b:free', error: detail, reason: classifyAIError(error) });
     }
   }
 
-  // Último recurso: modelo chico y liviano, casi siempre disponible
-  if (process.env.OPENROUTER_API_KEY) {
+  // Último recurso: otro modelo distinto (verificado que existe en el catálogo en vivo, aunque al 22/07/2026
+  // devuelve 429 por rate-limit upstream — se deja igual porque puede recuperarse y es mejor que no intentar nada).
+  if (process.env.OPENROUTER_API_KEY && !alreadyTried('openrouter', 'google/gemma-4-31b-it:free')) {
     try {
-      return await chatWithTools('https://openrouter.ai/api/v1/chat/completions', process.env.OPENROUTER_API_KEY, 'meta-llama/llama-3.1-8b-instruct:free', clean, onToolNotice);
+      return await chatWithTools('https://openrouter.ai/api/v1/chat/completions', process.env.OPENROUTER_API_KEY, 'google/gemma-4-31b-it:free', clean, onToolNotice);
     } catch (error) {
-      console.error('Error fallback OpenRouter:', error.message);
-      attempts.push({ provider: 'openrouter', model: 'meta-llama/llama-3.1-8b-instruct:free', error: error.message });
+      const detail = error.response?.data?.error?.message || error.message;
+      console.error('Error fallback Gemma:', detail);
+      attempts.push({ provider: 'openrouter', model: 'google/gemma-4-31b-it:free', error: detail, reason: classifyAIError(error) });
     }
   }
 
@@ -576,25 +606,24 @@ async function extractDocxText(buffer) {
 // ─────────────────────────────────────────
 // CATÁLOGO DE PROVEEDORES/MODELOS (fuente de verdad para validación y mensajes al usuario)
 // ─────────────────────────────────────────
+// Catálogo verificado en vivo contra /v1/models de cada proveedor el 22/07/2026 — los modelos gratis de
+// OpenRouter rotan sin aviso, así que si vuelve a fallar todo, este es el primer lugar para re-chequear.
 const MODELS_BY_PROVIDER = {
   groq: {
     default: 'llama-3.3-70b-versatile',
     models: {
       'llama-3.3-70b-versatile': 'Default — modelo principal, más capaz, uso general',
       'llama-3.1-8b-instant': 'Rápido, para tareas simples/livianas',
-      'gemma2-9b-it': 'Alternativa liviana de Google',
-      'mixtral-8x7b-32768': 'Contexto largo',
+      'openai/gpt-oss-120b': 'Open-weight de OpenAI, razonamiento fuerte',
     },
   },
   openrouter: {
-    default: 'meta-llama/llama-3.1-8b-instruct:free',
+    default: 'nvidia/nemotron-3-super-120b-a12b:free',
     models: {
-      'tencent/hy3:free': 'Fallback de razonamiento (uso interno del sistema)',
-      'meta-llama/llama-3.1-8b-instruct:free': 'Último recurso del sistema',
-      'deepseek/deepseek-r1:free': 'Razonamiento profundo/matemático',
-      'mistralai/mistral-7b-instruct:free': 'Liviano y rápido',
-      'qwen/qwen-2.5-72b-instruct:free': 'Modelo grande, multilingüe',
-      'z-ai/glm-4.5-air:free': 'GLM, uso general',
+      'nvidia/nemotron-3-super-120b-a12b:free': 'Default de OpenRouter — grande, razonamiento fuerte, respondió estable en las pruebas',
+      'nvidia/nemotron-3-nano-30b-a3b:free': 'Último recurso del sistema — rápido y liviano, respondió estable en las pruebas',
+      'google/gemma-4-31b-it:free': 'Modelo de Google — existe en el catálogo pero al 22/07/2026 devuelve 429 (rate-limited upstream), probar antes de confiar en él',
+      'openai/gpt-oss-20b:free': 'Open-weight de OpenAI — existe en el catálogo pero al 22/07/2026 devuelve 429 (rate-limited upstream), probar antes de confiar en él',
     },
   },
 };
@@ -642,13 +671,12 @@ function parseConfigCommand(text) {
     'llama-3.3-70b': 'llama-3.3-70b-versatile',
     'llama 3.3': 'llama-3.3-70b-versatile',
     'llama-3.1-8b': 'llama-3.1-8b-instant',
-    'gemma2': 'gemma2-9b-it',
-    'mixtral': 'mixtral-8x7b-32768',
-    'deepseek': 'deepseek/deepseek-r1:free',
-    'mistral': 'mistralai/mistral-7b-instruct:free',
-    'qwen': 'qwen/qwen-2.5-72b-instruct:free',
-    'hy3': 'tencent/hy3:free',
-    'glm': 'z-ai/glm-4.5-air:free',
+    'gemma': 'google/gemma-4-31b-it:free',
+    'nemotron nano': 'nvidia/nemotron-3-nano-30b-a3b:free',
+    'nemotron': 'nvidia/nemotron-3-super-120b-a12b:free',
+    'gpt-oss-20': 'openai/gpt-oss-20b:free',
+    'gpt-oss-120': 'openai/gpt-oss-120b',
+    'gpt oss': 'openai/gpt-oss-20b:free',
   };
 
   for (const [key, val] of Object.entries(models)) {
@@ -904,6 +932,14 @@ async function handleUserText(ctx, text) {
 
   if (isConfig) {
     const { provider, model } = parseConfigCommand(text);
+
+    // Si el usuario mencionó explícitamente "modelo" pero no matcheó ninguno del catálogo, no reguardar
+    // la config vieja como si el cambio hubiera aplicado — eso fue el bug real observado (pedir "modelo ZAI"
+    // no matcheaba nada y el bot respondía "✅ actualizada" sin cambiar nada).
+    if (text.toLowerCase().includes('modelo') && !model) {
+      return ctx.reply(formatModelCatalog(), { parse_mode: 'Markdown' });
+    }
+
     const current = await getConfig(userId);
     const newProvider = provider || current.provider;
     let newModel = model || current.model;
