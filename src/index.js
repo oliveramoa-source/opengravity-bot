@@ -7,6 +7,7 @@ require('dotenv').config({ path: path.resolve(__dirname, '../.env') });
 const { Telegraf } = require('telegraf');
 const axios = require('axios');
 const fs = require('fs');
+const http = require('http');
 const { MsEdgeTTS, OUTPUT_FORMAT } = require('msedge-tts');
 
 // ─────────────────────────────────────────
@@ -56,7 +57,7 @@ const bot = new Telegraf(process.env.TELEGRAM_BOT_TOKEN);
 async function getConfig(userId) {
   const doc = await db.collection('config').doc(String(userId)).get();
   if (!doc.exists) {
-    return { provider: 'groq', model: 'llama-3.3-70b-versatile' };
+    return { provider: 'openrouter', model: 'openai/gpt-oss-120b' };
   }
   return doc.data();
 }
@@ -370,8 +371,14 @@ function cleanMessages(messages) {
 async function chatWithTools(url, apiKey, model, messages, onToolNotice) {
   const headers = { 'Content-Type': 'application/json', Authorization: `Bearer ${apiKey}` };
   let convo = [...messages];
+  // Diagnóstico temporal (ver [[opengravity-bot-latencia]]): sin esto, agotar las rondas de
+  // herramientas queda invisible en los logs — no tira ningún error, solo devuelve el mensaje
+  // genérico. Necesitamos ver qué tool pidió el modelo en cada ronda para decidir el número
+  // correcto de rondas con datos reales en vez de conjeturar.
+  const providerLabel = url.includes('groq') ? 'groq' : 'openrouter';
+  let lastToolNames = [];
 
-  for (let round = 0; round < 5; round++) {
+  for (let round = 0; round < 3; round++) {
     const response = await axios.post(
       url,
       { model, messages: convo, temperature: 0.5, tools: TOOL_DEFS, tool_choice: 'auto' },
@@ -380,17 +387,24 @@ async function chatWithTools(url, apiKey, model, messages, onToolNotice) {
     const msg = response.data.choices[0].message;
 
     if (!msg.tool_calls || !msg.tool_calls.length) {
+      console.log(`[chatWithTools] ${providerLabel}/${model} ronda ${round + 1}/3: respuesta final sin tool_calls.`);
       return msg.content;
     }
+
+    lastToolNames = msg.tool_calls.map(tc => `${tc.function.name}(${tc.function.arguments})`);
+    console.log(`[chatWithTools] ${providerLabel}/${model} ronda ${round + 1}/3: pidió ${lastToolNames.join(', ')}`);
 
     if (onToolNotice) await onToolNotice(msg.tool_calls);
 
     convo.push({ role: 'assistant', content: msg.content || null, tool_calls: msg.tool_calls });
     for (const tc of msg.tool_calls) {
       const result = await executeToolCall(tc);
-      convo.push({ role: 'tool', tool_call_id: tc.id, content: String(result).slice(0, 4000) });
+      const resultStr = String(result);
+      console.log(`[chatWithTools] ${providerLabel}/${model} ronda ${round + 1}/3: resultado de ${tc.function.name} (${resultStr.length} chars): ${resultStr.slice(0, 300)}`);
+      convo.push({ role: 'tool', tool_call_id: tc.id, content: resultStr.slice(0, 4000) });
     }
   }
+  console.log(`[chatWithTools] ${providerLabel}/${model}: se quedó sin rondas. Último intento: ${lastToolNames.join(', ') || 'ninguno'}`);
   return 'No pude completar la respuesta tras varias búsquedas. Probá reformular la pregunta.';
 }
 
@@ -418,32 +432,23 @@ function classifyAIError(error) {
 
 async function callAI(messages, config, onToolNotice, userId) {
   const headers = { 'Content-Type': 'application/json' };
-  let provider = config?.provider || 'groq';
-  let model = config?.model || MODELS_BY_PROVIDER.groq.default;
+  // Groq retirado de la cadena de chat: se da de baja el 16/08/2026 (auditoría Fable, ítem 73).
+  // OpenRouter queda como único proveedor de chat. La transcripción de audio (Whisper, en
+  // transcribeAudio()) sigue usando Groq aparte — eso es un reemplazo distinto, todavía en investigación.
+  let provider = 'openrouter';
+  let model = config?.model || MODELS_BY_PROVIDER.openrouter.default;
   const clean = cleanMessages(messages);
   const attempts = [];
 
-  // Chequeo de sanidad: si la combinación guardada quedó inválida (proveedor desconocido o modelo
-  // retirado/inexistente en el catálogo), resetear al default del proveedor ANTES de llamar a la API,
-  // en vez de intentar con datos que sabemos que van a fallar. Se persiste para que la próxima consulta
-  // ya arranque con una config sana.
-  if (!MODELS_BY_PROVIDER[provider]) provider = 'groq';
+  // Chequeo de sanidad: si el modelo guardado quedó inválido (retirado/inexistente en el catálogo),
+  // resetear al default ANTES de llamar a la API, en vez de intentar con datos que sabemos que van a
+  // fallar. Se persiste para que la próxima consulta ya arranque con una config sana.
   if (!isValidModelForProvider(provider, model)) {
-    model = MODELS_BY_PROVIDER[provider].default;
+    model = MODELS_BY_PROVIDER.openrouter.default;
     if (userId) saveConfig(userId, { provider, model }).catch(() => {});
   }
 
-  if (provider === 'groq' && process.env.GROQ_API_KEY) {
-    try {
-      return await chatWithTools('https://api.groq.com/openai/v1/chat/completions', process.env.GROQ_API_KEY, model, clean, onToolNotice);
-    } catch (error) {
-      const detail = error.response?.data?.error?.message || error.message;
-      console.error('Error Groq:', detail);
-      attempts.push({ provider: 'groq', model, error: detail, reason: classifyAIError(error) });
-    }
-  }
-
-  if (provider === 'openrouter' && process.env.OPENROUTER_API_KEY) {
+  if (process.env.OPENROUTER_API_KEY) {
     try {
       return await chatWithTools('https://openrouter.ai/api/v1/chat/completions', process.env.OPENROUTER_API_KEY, model, clean, onToolNotice);
     } catch (error) {
@@ -453,14 +458,15 @@ async function callAI(messages, config, onToolNotice, userId) {
     }
   }
 
-  // Fallback final: Groq con modelo estable
-  if (process.env.GROQ_API_KEY) {
+  // Fallback final: reemplaza al viejo fallback de Groq (llama-3.3-70b-versatile) — mismo rol,
+  // modelo liviano y estable, pero vía OpenRouter (auditoría Fable, ítem 73).
+  if (process.env.OPENROUTER_API_KEY && model !== 'openai/gpt-oss-20b') {
     try {
-      return await chatWithTools('https://api.groq.com/openai/v1/chat/completions', process.env.GROQ_API_KEY, 'llama-3.3-70b-versatile', clean, onToolNotice);
+      return await chatWithTools('https://openrouter.ai/api/v1/chat/completions', process.env.OPENROUTER_API_KEY, 'openai/gpt-oss-20b', clean, onToolNotice);
     } catch (error) {
       const detail = error.response?.data?.error?.message || error.message;
-      console.error('Error fallback Groq:', detail);
-      attempts.push({ provider: 'groq', model: 'llama-3.3-70b-versatile', error: detail, reason: classifyAIError(error) });
+      console.error('Error fallback gpt-oss-20b:', detail);
+      attempts.push({ provider: 'openrouter', model: 'openai/gpt-oss-20b', error: detail, reason: classifyAIError(error) });
     }
   }
 
@@ -557,13 +563,16 @@ async function textToSpeech(text, userId) {
 // ─────────────────────────────────────────
 async function transcribeAudio(fileUrl) {
   try {
-    const response = await axios.get(fileUrl, { responseType: 'arraybuffer' });
+    console.log(`[transcribeAudio] descarga arranca: ${new Date().toISOString()}`);
+    const response = await axios.get(fileUrl, { responseType: 'arraybuffer', timeout: 15000 });
+    console.log(`[transcribeAudio] descarga termina (${response.data.length} bytes): ${new Date().toISOString()}`);
     const tempPath = path.join(__dirname, `audio_${Date.now()}.ogg`);
     fs.writeFileSync(tempPath, response.data);
     const FormData = require('form-data');
     const formData = new FormData();
     formData.append('file', fs.createReadStream(tempPath));
     formData.append('model', 'whisper-large-v3');
+    console.log(`[transcribeAudio] llamada a Whisper (Groq) arranca: ${new Date().toISOString()}`);
     const res = await axios.post(
       'https://api.groq.com/openai/v1/audio/transcriptions',
       formData,
@@ -572,6 +581,7 @@ async function transcribeAudio(fileUrl) {
         timeout: 30000,
       }
     );
+    console.log(`[transcribeAudio] llamada a Whisper (Groq) termina: ${new Date().toISOString()}`);
     fs.unlinkSync(tempPath);
     return res.data.text;
   } catch (error) {
@@ -606,24 +616,20 @@ async function extractDocxText(buffer) {
 // ─────────────────────────────────────────
 // CATÁLOGO DE PROVEEDORES/MODELOS (fuente de verdad para validación y mensajes al usuario)
 // ─────────────────────────────────────────
-// Catálogo verificado en vivo contra /v1/models de cada proveedor el 22/07/2026 — los modelos gratis de
-// OpenRouter rotan sin aviso, así que si vuelve a fallar todo, este es el primer lugar para re-chequear.
+// Catálogo verificado en vivo contra /v1/models de cada proveedor. Groq retirado como proveedor de
+// chat el 26/07/2026 (se da de baja el 16/08/2026, auditoría Fable ítem 73) — reemplazado por
+// openai/gpt-oss-120b (principal) y openai/gpt-oss-20b (liviano/fallback), ambos vía OpenRouter,
+// confirmados respondiendo en vivo el 26/07/2026. Los modelos gratis de OpenRouter rotan sin aviso,
+// así que si vuelve a fallar todo, este es el primer lugar para re-chequear.
 const MODELS_BY_PROVIDER = {
-  groq: {
-    default: 'llama-3.3-70b-versatile',
-    models: {
-      'llama-3.3-70b-versatile': 'Default — modelo principal, más capaz, uso general',
-      'llama-3.1-8b-instant': 'Rápido, para tareas simples/livianas',
-      'openai/gpt-oss-120b': 'Open-weight de OpenAI, razonamiento fuerte',
-    },
-  },
   openrouter: {
-    default: 'nvidia/nemotron-3-super-120b-a12b:free',
+    default: 'openai/gpt-oss-120b',
     models: {
-      'nvidia/nemotron-3-super-120b-a12b:free': 'Default de OpenRouter — grande, razonamiento fuerte, respondió estable en las pruebas',
+      'openai/gpt-oss-120b': 'Default — modelo principal, más capaz, uso general (reemplazo de Groq)',
+      'openai/gpt-oss-20b': 'Rápido/liviano, fallback automático si falla el principal',
+      'nvidia/nemotron-3-super-120b-a12b:free': 'Grande, razonamiento fuerte, respondió estable en las pruebas',
       'nvidia/nemotron-3-nano-30b-a3b:free': 'Último recurso del sistema — rápido y liviano, respondió estable en las pruebas',
       'google/gemma-4-31b-it:free': 'Modelo de Google — existe en el catálogo pero al 22/07/2026 devuelve 429 (rate-limited upstream), probar antes de confiar en él',
-      'openai/gpt-oss-20b:free': 'Open-weight de OpenAI — existe en el catálogo pero al 22/07/2026 devuelve 429 (rate-limited upstream), probar antes de confiar en él',
     },
   },
 };
@@ -632,7 +638,7 @@ function isValidModelForProvider(provider, model) {
   return !!MODELS_BY_PROVIDER[provider]?.models[model];
 }
 
-const PROVIDER_LABELS = { groq: 'Groq', openrouter: 'OpenRouter' };
+const PROVIDER_LABELS = { openrouter: 'OpenRouter' };
 
 function formatModelCatalog() {
   return `⚠️ Esa combinación no es válida.\nProveedores y modelos disponibles:\n\n${buildModelCatalogText()}`;
@@ -661,24 +667,21 @@ ${buildModelCatalogText()}`;
 // ─────────────────────────────────────────
 function parseConfigCommand(text) {
   const t = text.toLowerCase();
-  let provider = null;
-  let model = null;
-
-  if (t.includes('groq')) provider = 'groq';
-  else if (t.includes('openrouter')) provider = 'openrouter';
+  // Groq retirado como proveedor de chat (ver MODELS_BY_PROVIDER) — se deja reconocer 'groq' a
+  // propósito para que isValidModelForProvider() lo rechace explícitamente con el catálogo, en vez
+  // de caer en un no-op silencioso que reporte "✅ actualizada" sin haber cambiado nada.
+  let provider = t.includes('groq') ? 'groq' : (t.includes('openrouter') ? 'openrouter' : null);
 
   const models = {
-    'llama-3.3-70b': 'llama-3.3-70b-versatile',
-    'llama 3.3': 'llama-3.3-70b-versatile',
-    'llama-3.1-8b': 'llama-3.1-8b-instant',
     'gemma': 'google/gemma-4-31b-it:free',
     'nemotron nano': 'nvidia/nemotron-3-nano-30b-a3b:free',
     'nemotron': 'nvidia/nemotron-3-super-120b-a12b:free',
-    'gpt-oss-20': 'openai/gpt-oss-20b:free',
+    'gpt-oss-20': 'openai/gpt-oss-20b',
     'gpt-oss-120': 'openai/gpt-oss-120b',
-    'gpt oss': 'openai/gpt-oss-20b:free',
+    'gpt oss': 'openai/gpt-oss-20b',
   };
 
+  let model = null;
   for (const [key, val] of Object.entries(models)) {
     if (t.includes(key)) { model = val; break; }
   }
@@ -757,7 +760,7 @@ bot.start(async (ctx) => {
     `/buscar [query] — buscar en la web\n` +
     `/clear — borrar historial\n\n` +
     `O decime en lenguaje natural:\n` +
-    `_"Cambiá a Groq con llama-3.3-70b"_`,
+    `_"Cambiá al modelo gpt-oss-20b"_`,
     { parse_mode: 'Markdown' }
   );
 });
@@ -768,7 +771,7 @@ bot.command('config', async (ctx) => {
     `⚙️ *Configuración actual:*\n\n` +
     `• Provider: \`${config.provider}\`\n` +
     `• Modelo: \`${config.model}\`\n\n` +
-    `Para cambiar decime:\n_"Cambiá a OpenRouter con deepseek"_`,
+    `Para cambiar decime:\n_"Cambiá a OpenRouter con nemotron"_`,
     { parse_mode: 'Markdown' }
   );
 });
@@ -844,7 +847,7 @@ bot.command('buscar', async (ctx) => {
     ...history,
     { role: 'user', content: `${query}\n\nResultados web:\n${results}` },
   ];
-  const aiReply = await callAI(messages, config, null, ctx.from.id);
+  const aiReply = await callAIWithTimeout(messages, config, null, ctx.from.id);
   await saveMessage(ctx.from.id, 'user', `/buscar ${query}`);
   await saveMessage(ctx.from.id, 'assistant', aiReply);
   await replyWithAudio(ctx, aiReply);
@@ -853,14 +856,43 @@ bot.command('buscar', async (ctx) => {
 // ─────────────────────────────────────────
 // HELPER: enviar respuesta en texto + audio
 // ─────────────────────────────────────────
+// Cloud Run corta cada mensaje a los 90s (handlerTimeout de Telegraf) y sin bot.catch() eso
+// tumba el proceso entero. El TTS (llamada de red a Microsoft Edge) puede colgarse sin arrojar
+// error propio, así que lo acotamos acá para que, si tarda demasiado, se salte el audio en vez
+// de crashear el handler completo.
+const TTS_TIMEOUT_MS = 60000;
+function withTimeout(promise, ms) {
+  return Promise.race([
+    promise,
+    new Promise((resolve) => setTimeout(() => resolve(null), ms)),
+  ]);
+}
+
+// Red de seguridad adicional: aunque bajamos las rondas de chatWithTools de 5 a 3, la cadena de
+// fallback de callAI() sigue probando hasta 5 combinaciones proveedor/modelo en secuencia, y eso
+// puede acumularse. Si supera este umbral, respondemos antes de que Telegraf mate el handler a los 90s.
+// Se dejó margen real para lo que rodea a esta llamada dentro del mismo handler: descarga+transcripción
+// de audio (hasta ~15-30s en el caso de mensajes de voz) antes, y TTS + envío de la nota de voz (hasta
+// ~15-20s) después. Un valor más alto (se probó 65s) dejaba pasar el TTS fuera del handlerTimeout de 90s.
+const AI_TIMEOUT_MS = 40000;
+async function callAIWithTimeout(messages, config, onToolNotice, userId) {
+  const result = await withTimeout(callAI(messages, config, onToolNotice, userId), AI_TIMEOUT_MS);
+  return result === null ? 'Perdón, tardé demasiado en responder. Probá de nuevo o reformulá la pregunta.' : result;
+}
+
 async function replyWithAudio(ctx, text) {
-  // 1. Respuesta en texto
+  // Diagnóstico temporal (ver [[opengravity-bot-latencia]]): un mensaje que solo debía leer
+  // Firestore (isConfigQuery, sin IA de por medio) tardó ~82s de punta a punta sin logs intermedios.
+  // Instrumentado para ver si el cuello de botella es el envío del texto, el TTS o el envío de la nota de voz.
+  console.log(`[replyWithAudio] antes de ctx.reply(texto): ${new Date().toISOString()}`);
   await ctx.reply(text, { parse_mode: 'Markdown' }).catch(() => ctx.reply(text));
-  // 2. Respuesta en audio (TTS)
-  const audioPath = await textToSpeech(text, ctx.from.id);
+  console.log(`[replyWithAudio] después de ctx.reply(texto), antes de TTS: ${new Date().toISOString()}`);
+  const audioPath = await withTimeout(textToSpeech(text, ctx.from.id), TTS_TIMEOUT_MS);
+  console.log(`[replyWithAudio] después de TTS (audioPath=${!!audioPath}): ${new Date().toISOString()}`);
   if (audioPath) {
     try {
       await ctx.replyWithVoice({ source: audioPath });
+      console.log(`[replyWithAudio] después de replyWithVoice: ${new Date().toISOString()}`);
     } catch (e) {
       console.error('Error enviando audio TTS:', e.message);
     } finally {
@@ -898,10 +930,13 @@ async function handleUserText(ctx, text) {
 
   // ── Consulta de la config vigente — lectura directa de Firestore, sin tocar la IA ──
   if (isConfigQuery(text)) {
+    console.log(`[isConfigQuery] antes de getConfig: ${new Date().toISOString()}`);
     const config = await getConfig(userId);
+    console.log(`[isConfigQuery] después de getConfig: ${new Date().toISOString()}`);
     const reply = `⚙️ Estoy funcionando con:\n• Provider: *${config.provider}*\n• Modelo: *${config.model}*`;
     await saveMessage(userId, 'user', text);
     await saveMessage(userId, 'assistant', reply);
+    console.log(`[isConfigQuery] después de los 2 saveMessage, antes de replyWithAudio: ${new Date().toISOString()}`);
     return replyWithAudio(ctx, reply);
   }
 
@@ -917,7 +952,7 @@ async function handleUserText(ctx, text) {
     const voiceLabel = TTS_VOICES[newTts.voice]?.label || newTts.voice;
     const reply = `✅ Listo. Voz: ${voiceLabel} — Velocidad: ${newTts.speed}x`;
     await ctx.reply(reply, { parse_mode: 'Markdown' });
-    const audioPath = await textToSpeech('Listo, así suena la voz ahora.', userId);
+    const audioPath = await withTimeout(textToSpeech('Listo, así suena la voz ahora.', userId), TTS_TIMEOUT_MS);
     if (audioPath) {
       try { await ctx.replyWithVoice({ source: audioPath }); }
       finally { try { fs.unlinkSync(audioPath); } catch (_) {} }
@@ -943,6 +978,12 @@ async function handleUserText(ctx, text) {
     const current = await getConfig(userId);
     const newProvider = provider || current.provider;
     let newModel = model || current.model;
+
+    // Proveedor inexistente en el catálogo (ej. "groq", retirado) — rechazar explícito, sin
+    // intentar leer un default que no existe.
+    if (!MODELS_BY_PROVIDER[newProvider]) {
+      return ctx.reply(formatModelCatalog(), { parse_mode: 'Markdown' });
+    }
 
     if (!isValidModelForProvider(newProvider, newModel)) {
       if (provider && !model) {
@@ -987,10 +1028,16 @@ async function handleUserText(ctx, text) {
     else if (names.includes('leer_url')) await ctx.reply('🌐 Leyendo el enlace...');
   };
 
-  const aiReply = await callAI(messages, config, onToolNotice, userId);
+  const aiReply = await callAIWithTimeout(messages, config, onToolNotice, userId);
   await saveMessage(userId, 'assistant', aiReply);
   await replyWithAudio(ctx, aiReply);
 }
+
+// Sin esto, cualquier error no capturado dentro de un handler (incluido el handlerTimeout
+// de 90s de Telegraf) tumba el proceso entero en vez de solo quedar logueado.
+bot.catch((err, ctx) => {
+  console.error('Error no manejado en un handler de Telegraf:', err.message);
+});
 
 bot.on('text', async (ctx) => {
   await ctx.sendChatAction('typing');
@@ -1004,13 +1051,23 @@ bot.on('voice', async (ctx) => {
   const userId = ctx.from.id;
   await ctx.sendChatAction('typing');
   try {
+    // Diagnóstico temporal (ver [[opengravity-bot-latencia]]): última prueba mostró ~91s de silencio
+    // total sin ningún log, con una respuesta que ni siquiera llama a la IA (isConfigQuery). Sin
+    // timestamps por sub-paso no se puede saber si el tiempo se va en getFile(), en la descarga del
+    // audio o en la llamada a Whisper de Groq.
+    console.log(`[voice] t0 arranca handler: ${new Date().toISOString()}`);
     await ctx.reply('🎙️ Procesando audio...');
+    console.log(`[voice] t1 antes de getFile: ${new Date().toISOString()}`);
     const file = await ctx.telegram.getFile(ctx.message.voice.file_id);
+    console.log(`[voice] t2 después de getFile: ${new Date().toISOString()}`);
     const fileUrl = `https://api.telegram.org/file/bot${process.env.TELEGRAM_BOT_TOKEN}/${file.file_path}`;
     const transcribed = await transcribeAudio(fileUrl);
+    console.log(`[voice] t3 después de transcribeAudio: ${new Date().toISOString()}`);
     if (!transcribed) return ctx.reply('❌ No pude entender el audio.');
     await ctx.reply(`🎤 *Dijiste:* "${transcribed}"`, { parse_mode: 'Markdown' });
+    console.log(`[voice] t4 antes de handleUserText: ${new Date().toISOString()}`);
     await handleUserText(ctx, transcribed);
+    console.log(`[voice] t5 después de handleUserText: ${new Date().toISOString()}`);
   } catch (error) {
     console.error('Error en voice:', error);
     ctx.reply('Ocurrió un error procesando tu audio.');
@@ -1039,7 +1096,7 @@ bot.on('document', async (ctx) => {
     await ctx.reply(`📄 Procesando "${fileName}"...`);
     const file = await ctx.telegram.getFile(doc.file_id);
     const fileUrl = `https://api.telegram.org/file/bot${process.env.TELEGRAM_BOT_TOKEN}/${file.file_path}`;
-    const response = await axios.get(fileUrl, { responseType: 'arraybuffer' });
+    const response = await axios.get(fileUrl, { responseType: 'arraybuffer', timeout: 15000 });
     tempPath = path.join(__dirname, `doc_${Date.now()}${ext}`);
     fs.writeFileSync(tempPath, response.data);
 
@@ -1058,7 +1115,7 @@ bot.on('document', async (ctx) => {
       ...history,
       { role: 'user', content: userPrompt },
     ];
-    const aiReply = await callAI(messages, config, null, userId);
+    const aiReply = await callAIWithTimeout(messages, config, null, userId);
     await saveMessage(userId, 'user', `[documento] ${fileName}`);
     await saveMessage(userId, 'assistant', aiReply);
     await replyWithAudio(ctx, aiReply);
@@ -1075,43 +1132,77 @@ bot.on('document', async (ctx) => {
 // ─────────────────────────────────────────
 // ARRANQUE
 // ─────────────────────────────────────────
-async function testGroq() {
-  if (!process.env.GROQ_API_KEY) { console.log('⚠️ GROQ_API_KEY no definida'); return; }
+// Reemplaza al viejo testGroq(): el chequeo de sanidad de arranque ahora valida OpenRouter, que es
+// el único proveedor de chat desde que se retiró Groq (ver MODELS_BY_PROVIDER). max_tokens en 50 y
+// no en 5: los modelos gpt-oss son de razonamiento y gastan tokens en el razonamiento oculto antes
+// del contenido final — con un límite muy chico el content vuelve null y esto tiraría un TypeError.
+async function testOpenRouter() {
+  if (!process.env.OPENROUTER_API_KEY) { console.log('⚠️ OPENROUTER_API_KEY no definida'); return; }
   try {
-    const r = await axios.post('https://api.groq.com/openai/v1/chat/completions',
-      { model: 'llama-3.3-70b-versatile', messages: [{ role: 'user', content: 'di hola' }], max_tokens: 5 },
-      { headers: { Authorization: `Bearer ${process.env.GROQ_API_KEY}`, 'Content-Type': 'application/json' }, timeout: 10000 }
+    const r = await axios.post('https://openrouter.ai/api/v1/chat/completions',
+      { model: MODELS_BY_PROVIDER.openrouter.default, messages: [{ role: 'user', content: 'di hola' }], max_tokens: 50 },
+      { headers: { Authorization: `Bearer ${process.env.OPENROUTER_API_KEY}`, 'Content-Type': 'application/json' }, timeout: 15000 }
     );
-    console.log('✅ Groq OK:', r.data.choices[0].message.content.slice(0, 30));
+    console.log('✅ OpenRouter OK:', r.data.choices[0].message.content?.slice(0, 30));
   } catch (e) {
-    console.error('❌ Groq FALLA:', e.response?.status, JSON.stringify(e.response?.data?.error));
+    console.error('❌ OpenRouter FALLA:', e.response?.status, JSON.stringify(e.response?.data?.error));
   }
 }
 
-async function startBot(attempt = 1) {
-  console.log(`🚀 Iniciando OpenGravity Bot... (intento ${attempt})`);
-  try {
-    await bot.telegram.deleteWebhook({ drop_pending_updates: true });
-    console.log('🔁 Sesión anterior limpiada.');
-  } catch (e) {
-    console.warn('Aviso al limpiar webhook:', e.message);
+// Cloud Run escala a cero y no puede sostener un loop de polling (bot.launch()) — el bot
+// recibe los updates vía webhook: Telegram le pega a WEBHOOK_URL/<path secreto> cuando hay un mensaje nuevo.
+const WEBHOOK_PATH = `/telegraf/${process.env.TELEGRAM_BOT_TOKEN}`;
+const PORT = process.env.PORT || 8080;
+
+async function startBot() {
+  console.log('🚀 Iniciando OpenGravity Bot (modo webhook)...');
+  await testOpenRouter();
+
+  const webhookUrl = process.env.WEBHOOK_URL;
+  if (!webhookUrl) {
+    // Cloud Run asigna la URL del servicio recién en el primer deploy: el contenedor igual debe
+    // levantar y responder al health check para que el deploy no falle. El webhook se registra
+    // en un deploy posterior, una vez que WEBHOOK_URL ya se conoce y está seteado.
+    console.warn('⚠️ WEBHOOK_URL no configurado todavía — el servidor arranca pero NO registra el webhook de Telegram.');
   }
-  await testGroq();
-  // Esperar a que Railway apague la instancia anterior (más tiempo en reintentos)
-  const delay = attempt === 1 ? 5000 : 15000;
-  await new Promise(r => setTimeout(r, delay));
-  try {
-    await bot.launch({ dropPendingUpdates: true });
-    console.log('✅ Bot conectado y escuchando mensajes.');
-  } catch (err) {
-    if (err.message?.includes('409') && attempt < 5) {
-      console.warn(`⚠️ Conflicto 409, reintentando en 15s... (intento ${attempt}/5)`);
-      await new Promise(r => setTimeout(r, 15000));
-      return startBot(attempt + 1);
+
+  // No usamos bot.webhookCallback(): ese helper de Telegraf ata la respuesta HTTP a Telegram a que
+  // termine TODO el procesamiento del update (incluida la llamada a la IA). Si eso tarda, Telegram
+  // no recibe el 200 a tiempo y reenvía el mismo update — visto en producción: un mismo mensaje de
+  // audio se procesó dos veces (una con Groq, otra con OpenRouter) porque el primer intento tardó
+  // más de lo que Telegram espera. Acá confirmamos la recepción de inmediato y procesamos en
+  // background, desacoplando el ACK del procesamiento real.
+  const server = http.createServer((req, res) => {
+    if (req.url === '/' || req.url === '/health') {
+      res.writeHead(200, { 'Content-Type': 'text/plain' });
+      return res.end('OK');
     }
-    console.error('❌ Fallo al iniciar:', err.message);
-    process.exit(1);
-  }
+    if (req.method === 'POST' && req.url === WEBHOOK_PATH) {
+      let body = '';
+      req.on('data', (chunk) => { body += chunk; });
+      req.on('end', () => {
+        res.writeHead(200, { 'Content-Type': 'application/json' });
+        res.end('{"ok":true}');
+        try {
+          const update = JSON.parse(body);
+          bot.handleUpdate(update).catch((err) => console.error('Error procesando update en background:', err.message));
+        } catch (err) {
+          console.error('Error parseando update de Telegram:', err.message);
+        }
+      });
+      return;
+    }
+    res.writeHead(404);
+    return res.end();
+  });
+
+  server.listen(PORT, async () => {
+    console.log(`✅ Servidor HTTP escuchando en el puerto ${PORT}.`);
+    if (webhookUrl) {
+      await bot.telegram.setWebhook(`${webhookUrl}${WEBHOOK_PATH}`, { drop_pending_updates: true });
+      console.log('✅ Webhook configurado y bot listo para recibir mensajes.');
+    }
+  });
 }
 
 startBot();

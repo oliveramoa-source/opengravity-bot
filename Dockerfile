@@ -7,10 +7,12 @@ RUN apt-get update && apt-get install -y ffmpeg python3 make g++ && rm -rf /var/
 
 # Copiar e instalar dependencias
 COPY package*.json ./
-RUN npm install
+RUN npm install --omit=dev
 
 # Copiar codigo
 COPY src ./src
+
+EXPOSE 8080
 
 # Iniciar bot
 CMD ["node", "src/index.js"]
