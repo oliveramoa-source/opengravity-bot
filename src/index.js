@@ -9,6 +9,7 @@ const axios = require('axios');
 const fs = require('fs');
 const http = require('http');
 const { MsEdgeTTS, OUTPUT_FORMAT } = require('msedge-tts');
+const { google } = require('googleapis');
 
 // ─────────────────────────────────────────
 // FIREBASE ADMIN
@@ -52,6 +53,112 @@ if (!process.env.TELEGRAM_BOT_TOKEN) {
 const bot = new Telegraf(process.env.TELEGRAM_BOT_TOKEN);
 
 // ─────────────────────────────────────────
+// ALLOWLIST (C1) — regla dura, primera línea de todo
+// ─────────────────────────────────────────
+// Registrado ANTES de cualquier otro bot.start/command/action/on: en Telegraf los middlewares
+// corren en orden de registro para cada update, así que este bot.use() corta cualquier update
+// de un user_id distinto ANTES de que llegue a cualquier otro handler — sin responder, sin
+// loguear el contenido, sin procesar nada. Sin esto, ningún gate de confirmación downstream
+// (Gmail, Calendar) tiene sentido: una confirmación vale lo que valga la certeza de quién la dio.
+if (!process.env.TELEGRAM_ALLOWED_USER_ID) {
+  console.error('ERROR: TELEGRAM_ALLOWED_USER_ID no configurado');
+  process.exit(1);
+}
+bot.use(async (ctx, next) => {
+  if (String(ctx.from?.id) !== String(process.env.TELEGRAM_ALLOWED_USER_ID)) return;
+  return next();
+});
+
+// ─────────────────────────────────────────
+// GOOGLE OAUTH2 — Gmail / Calendar / Tasks (ítem 88, v5.1: proyecto en modo "Testing" a
+// propósito, nunca "Production" — evita pagar la verificación CASA Tier 2 que exige el scope
+// restringido gmail.modify. Consecuencia aceptada: el refresh token vence cada 7 días; ver
+// handleOAuthExpiry() más abajo para la detección + aviso proactivo)
+// ─────────────────────────────────────────
+const GOOGLE_OAUTH_SCOPES = [
+  'https://www.googleapis.com/auth/gmail.send',
+  'https://www.googleapis.com/auth/gmail.modify',
+  'https://www.googleapis.com/auth/calendar.events',
+  'https://www.googleapis.com/auth/tasks',
+];
+
+const googleOAuthClient = new google.auth.OAuth2(
+  process.env.GOOGLE_OAUTH_CLIENT_ID,
+  process.env.GOOGLE_OAUTH_CLIENT_SECRET
+);
+if (process.env.GOOGLE_OAUTH_REFRESH_TOKEN) {
+  googleOAuthClient.setCredentials({ refresh_token: process.env.GOOGLE_OAUTH_REFRESH_TOKEN });
+}
+
+function buildReauthUrl() {
+  return googleOAuthClient.generateAuthUrl({
+    access_type: 'offline',
+    prompt: 'consent',
+    scope: GOOGLE_OAUTH_SCOPES,
+  });
+}
+
+const gmailClient = google.gmail({ version: 'v1', auth: googleOAuthClient });
+const calendarClient = google.calendar({ version: 'v3', auth: googleOAuthClient });
+const tasksClient = google.tasks({ version: 'v1', auth: googleOAuthClient });
+
+// true mientras el token esté marcado como vencido — evita seguir reintentando llamadas que
+// sabemos que van a fallar hasta que Mariano reautorice.
+let googleOAuthExpired = false;
+
+function isOAuthExpiryError(error) {
+  const code = error.response?.data?.error;
+  const message = error.response?.data?.error_description || error.message || '';
+  // invalid_grant es específico de token/refresh_token vencido o revocado — distinto de un 429
+  // (rate limit), un 5xx (caída del servicio) o un error de red, que no deben tratarse igual.
+  return code === 'invalid_grant' || /invalid_grant/i.test(message);
+}
+
+// Detección + aviso proactivo (ítem 88): nunca falla en silencio, nunca reintenta ni simula éxito.
+async function handleOAuthExpiry(userId, error) {
+  googleOAuthExpired = true;
+  const reauthUrl = buildReauthUrl();
+  const detail = error.response?.data?.error_description || error.message;
+  try {
+    await bot.telegram.sendMessage(
+      userId,
+      `⚠️ *El token de Gmail/Calendar/Tasks venció.*\n\n` +
+      `Es esperable (modo Testing, ciclo de 7 días) — no es un error del Bot.\n\n` +
+      `Reautorizá acá (un clic, después el Bot vuelve a andar normal):\n${reauthUrl}`,
+      { parse_mode: 'Markdown' }
+    );
+  } catch (sendError) {
+    console.error('Error avisando vencimiento de OAuth por Telegram:', sendError.message);
+  }
+  await logAccion({
+    accion: 'oauth_vencimiento_detectado',
+    destinatario_o_archivo: 'google-oauth-refresh-token',
+    confirmada: false,
+    resultado: `detectado: ${detail}`,
+  });
+}
+
+// Wrapper único para toda llamada a Gmail/Calendar/Tasks: separa "vencido, hay que reautorizar"
+// de cualquier otro error (red, cuota, request inválida), y nunca reintenta cuando ya sabemos
+// que el token está vencido — solo avisa que la reautorización está pendiente.
+async function callGoogleAPI(userId, fn) {
+  if (googleOAuthExpired) {
+    return { ok: false, expired: true };
+  }
+  try {
+    const data = await fn();
+    return { ok: true, data };
+  } catch (error) {
+    if (isOAuthExpiryError(error)) {
+      await handleOAuthExpiry(userId, error);
+      return { ok: false, expired: true };
+    }
+    console.error('Error llamando a Google API:', error.response?.data || error.message);
+    return { ok: false, expired: false, error: error.response?.data?.error?.message || error.message };
+  }
+}
+
+// ─────────────────────────────────────────
 // CONFIGURACIÓN DEL BOT (guardada en Firebase)
 // ─────────────────────────────────────────
 async function getConfig(userId) {
@@ -64,6 +171,30 @@ async function getConfig(userId) {
 
 async function saveConfig(userId, config) {
   await db.collection('config').doc(String(userId)).set(config, { merge: true });
+}
+
+// ─────────────────────────────────────────
+// REGISTRO DE ACCIONES — log_acciones (C6), append-only
+// ─────────────────────────────────────────
+// Nunca se hace update() ni delete() sobre un registro ya escrito, solo add() — es auditoría.
+async function logAccion({ accion, destinatario_o_archivo, confirmada, resultado }) {
+  try {
+    await db.collection('log_acciones').add({
+      timestamp: new Date().toISOString(),
+      accion,
+      destinatario_o_archivo,
+      confirmada: !!confirmada,
+      resultado,
+    });
+  } catch (error) {
+    console.error('Error escribiendo en log_acciones:', error.message);
+  }
+}
+
+async function getConfiguracionBot() {
+  const doc = await db.collection('configuracion_bot').doc('default').get();
+  if (!doc.exists) return { hora_aviso_diario: '09:00', timezone: 'America/Argentina/Buenos_Aires' };
+  return doc.data();
 }
 
 // ─────────────────────────────────────────
@@ -113,71 +244,376 @@ async function getIdeas(userId) {
 }
 
 // ─────────────────────────────────────────
+// GMAIL — redactar/enviar y papelera, siempre con gate de confirmación (C2/C3)
+// ─────────────────────────────────────────
+// RFC 2822 exige headers ASCII puros — un Subject con tildes/ñ sin codificar se manda como bytes
+// UTF-8 crudos dentro del header, y cada cliente de mail los interpreta con un charset distinto
+// (bug real visto en vivo 29/07/2026: "envío" llegó a la bandeja de entrada como "envÃƒÂ­o"). El
+// body no tiene este problema porque el Content-Type ya declara charset=utf-8 explícito. La forma
+// correcta es un "encoded word" RFC 2047.
+function encodeMimeHeader(text) {
+  if (/^[\x00-\x7F]*$/.test(text)) return text;
+  return `=?UTF-8?B?${Buffer.from(text, 'utf8').toString('base64')}?=`;
+}
+
+function buildRawEmail({ to, subject, body }) {
+  const message = [`To: ${to}`, `Subject: ${encodeMimeHeader(subject)}`, 'Content-Type: text/plain; charset=utf-8', '', body].join('\n');
+  return Buffer.from(message).toString('base64').replace(/\+/g, '-').replace(/\//g, '_').replace(/=+$/, '');
+}
+
+async function gmailSend(userId, { to, subject, body }) {
+  const result = await callGoogleAPI(userId, () =>
+    gmailClient.users.messages.send({ userId: 'me', requestBody: { raw: buildRawEmail({ to, subject, body }) } })
+  );
+  await logAccion({
+    accion: 'gmail_enviar',
+    destinatario_o_archivo: to,
+    confirmada: true,
+    resultado: result.ok ? `enviado, id ${result.data.data.id}` : (result.expired ? 'token vencido' : `error: ${result.error}`),
+  });
+  return result;
+}
+
+async function gmailTrash(userId, messageId) {
+  const result = await callGoogleAPI(userId, () => gmailClient.users.messages.trash({ userId: 'me', id: messageId }));
+  await logAccion({
+    accion: 'gmail_papelera',
+    destinatario_o_archivo: messageId,
+    confirmada: true,
+    resultado: result.ok ? 'movido a papelera' : (result.expired ? 'token vencido' : `error: ${result.error}`),
+  });
+  return result;
+}
+
+// ─────────────────────────────────────────
+// CALENDAR — libre sin invitados, gate de confirmación con invitados (C2/C3)
+// ─────────────────────────────────────────
+function buildReminders(reminderMinutes) {
+  if (!reminderMinutes) return undefined;
+  return { useDefault: false, overrides: [{ method: 'popup', minutes: reminderMinutes }] };
+}
+
+async function calendarCreateEvent(userId, { summary, description, start, end, attendees, reminderMinutes }) {
+  const result = await callGoogleAPI(userId, () =>
+    calendarClient.events.insert({
+      calendarId: 'primary',
+      sendUpdates: attendees && attendees.length ? 'all' : 'none',
+      requestBody: {
+        summary,
+        description,
+        start: { dateTime: start, timeZone: 'America/Argentina/Buenos_Aires' },
+        end: { dateTime: end, timeZone: 'America/Argentina/Buenos_Aires' },
+        attendees: (attendees || []).map((email) => ({ email })),
+        reminders: buildReminders(reminderMinutes),
+      },
+    })
+  );
+  await logAccion({
+    accion: 'calendar_crear_evento',
+    destinatario_o_archivo: summary,
+    confirmada: !!(attendees && attendees.length),
+    resultado: result.ok ? `creado, id ${result.data.data.id}` : (result.expired ? 'token vencido' : `error: ${result.error}`),
+  });
+  return result;
+}
+
+// Edita un evento existente (patch, no reemplaza campos no enviados) — mismo gate que crear:
+// libre si no toca invitados, confirmación si agrega/notifica invitados.
+async function calendarUpdateEvent(userId, { eventId, summary, description, start, end, attendees, reminderMinutes }) {
+  const requestBody = {};
+  if (summary !== undefined) requestBody.summary = summary;
+  if (description !== undefined) requestBody.description = description;
+  if (start !== undefined) requestBody.start = { dateTime: start, timeZone: 'America/Argentina/Buenos_Aires' };
+  if (end !== undefined) requestBody.end = { dateTime: end, timeZone: 'America/Argentina/Buenos_Aires' };
+  if (attendees !== undefined) requestBody.attendees = attendees.map((email) => ({ email }));
+  if (reminderMinutes !== undefined) requestBody.reminders = buildReminders(reminderMinutes);
+  const result = await callGoogleAPI(userId, () =>
+    calendarClient.events.patch({ calendarId: 'primary', eventId, sendUpdates: attendees && attendees.length ? 'all' : 'none', requestBody })
+  );
+  await logAccion({
+    accion: 'calendar_editar_evento',
+    destinatario_o_archivo: eventId,
+    confirmada: !!(attendees && attendees.length),
+    resultado: result.ok ? 'editado' : (result.expired ? 'token vencido' : `error: ${result.error}`),
+  });
+  return result;
+}
+
+// Calendar no tiene "papelera" nativa vía API — events.delete es el equivalente más cercano
+// (queda unos días recuperable desde la papelera de Calendar en la UI web).
+async function calendarDeleteEvent(userId, eventId, hasAttendees) {
+  const result = await callGoogleAPI(userId, () =>
+    calendarClient.events.delete({ calendarId: 'primary', eventId, sendUpdates: hasAttendees ? 'all' : 'none' })
+  );
+  await logAccion({
+    accion: 'calendar_borrar_evento',
+    destinatario_o_archivo: eventId,
+    confirmada: true,
+    resultado: result.ok ? 'borrado' : (result.expired ? 'token vencido' : `error: ${result.error}`),
+  });
+  return result;
+}
+
+// Busca eventos por texto y/o rango de fechas para resolver el eventId sin pedírselo a Mariano
+// (pedido suyo 28/07/2026: tener que buscar el ID a mano en Google Calendar para editar/borrar es
+// engorroso — el Bot tiene que poder encontrar el evento por título/horario y confirmar con él
+// cuál es antes de tocarlo).
+async function calendarSearchEvents(userId, { query, timeMin, timeMax }) {
+  const now = new Date();
+  const effectiveMin = timeMin || now.toISOString();
+  const effectiveMax = timeMax || new Date(now.getTime() + 30 * 24 * 60 * 60 * 1000).toISOString();
+  const result = await callGoogleAPI(userId, () =>
+    calendarClient.events.list({
+      calendarId: 'primary',
+      q: query || undefined,
+      timeMin: effectiveMin,
+      timeMax: effectiveMax,
+      singleEvents: true,
+      orderBy: 'startTime',
+      maxResults: 15,
+    })
+  );
+  return result;
+}
+
+// ─────────────────────────────────────────
+// GOOGLE TASKS — crear/editar/marcar, sin gate (no toca terceros)
+// ─────────────────────────────────────────
+async function tasksGetDefaultListId(userId) {
+  const result = await callGoogleAPI(userId, () => tasksClient.tasklists.list({ maxResults: 1 }));
+  if (!result.ok) return null;
+  return result.data.data.items?.[0]?.id || null;
+}
+
+async function tasksCreate(userId, { title, notes, due }) {
+  const listId = await tasksGetDefaultListId(userId);
+  if (!listId) return { ok: false, expired: googleOAuthExpired };
+  const result = await callGoogleAPI(userId, () =>
+    tasksClient.tasks.insert({ tasklist: listId, requestBody: { title, notes, due } })
+  );
+  await logAccion({
+    accion: 'tasks_crear',
+    destinatario_o_archivo: title,
+    confirmada: false,
+    resultado: result.ok ? `creada, id ${result.data.data.id}` : (result.expired ? 'token vencido' : `error: ${result.error}`),
+  });
+  return result;
+}
+
+async function tasksComplete(userId, taskId) {
+  const listId = await tasksGetDefaultListId(userId);
+  if (!listId) return { ok: false, expired: googleOAuthExpired };
+  const result = await callGoogleAPI(userId, () =>
+    tasksClient.tasks.patch({ tasklist: listId, task: taskId, requestBody: { status: 'completed' } })
+  );
+  await logAccion({
+    accion: 'tasks_marcar',
+    destinatario_o_archivo: taskId,
+    confirmada: false,
+    resultado: result.ok ? 'marcada completa' : (result.expired ? 'token vencido' : `error: ${result.error}`),
+  });
+  return result;
+}
+
+// Lista tareas pendientes por texto para resolver el taskId sin pedírselo a Mariano (mismo
+// problema real detectado 28/07/2026 en Calendar, agravado acá: no existía NINGUNA forma de listar
+// tareas existentes — marcar_tarea_completa no tenía cómo conseguir el taskId más que preguntándole
+// a él a mano).
+async function tasksSearch(userId, { query }) {
+  const listId = await tasksGetDefaultListId(userId);
+  if (!listId) return { ok: false, expired: googleOAuthExpired };
+  const result = await callGoogleAPI(userId, () =>
+    tasksClient.tasks.list({ tasklist: listId, showCompleted: false, maxResults: 50 })
+  );
+  if (!result.ok) return result;
+  let items = result.data.data.items || [];
+  if (query) {
+    const q = query.toLowerCase();
+    items = items.filter((t) => (t.title || '').toLowerCase().includes(q));
+  }
+  return { ok: true, data: { data: { items } } };
+}
+
+// ─────────────────────────────────────────
+// GATE DE CONFIRMACIÓN (C10) — ciclo iterativo de borrador (Fase 1, pedido de Mariano 28/07/2026)
+// ─────────────────────────────────────────
+// Estado pendiente en memoria (mismo patrón que pendingIdeas más abajo): efímero, no necesita
+// Firestore — si el proceso reinicia entre la propuesta y la confirmación, se pierde y hay que
+// volver a pedirla, comportamiento aceptable para un gate de confirmación.
+// pendingConfirmationsByUser indexa por userId (además del id) para que handleUserText pueda
+// saber, ante cualquier mensaje de texto libre, si Mariano le está respondiendo a un borrador
+// pendiente — así "dale"/"confirmalo"/una corrección en lenguaje natural resuelven el borrador
+// sin depender de que toque un botón.
+const pendingConfirmations = new Map();
+const pendingConfirmationsByUser = new Map();
+let confirmationSeq = 0;
+
+// Etiqueta, letra atajo y sinónimos por tipo de acción (pedido de Mariano 29/07/2026): además del
+// botón y de confirmaciones genéricas ("dale", "sí"), cada kind tiene su propia palabra/letra —
+// tipear "editar", "cambiar" o solo "D" confirma un borrador de calendar_update igual que tocar el
+// botón. La letra de cada acción se eligió para no colisionar nunca con la "C" de Cancelar (por eso
+// "creAr"/A y "eDitar"/D en vez de la inicial de la palabra).
+const ACTION_LABELS = {
+  email_send: { display: 'Enviar', letter: 'E', synonyms: ['enviar', 'envia', 'envía', 'mandalo', 'mandala', 'mandá', 'manda'] },
+  email_trash: { display: 'Borrar', letter: 'B', synonyms: ['borrar', 'eliminar', 'mover'] },
+  calendar_event: { display: 'creAr', letter: 'A', synonyms: ['crear', 'creá', 'crea'] },
+  calendar_update: { display: 'eDitar', letter: 'D', synonyms: ['editar', 'cambiar', 'cambiá', 'cambia', 'modificar'] },
+  calendar_delete: { display: 'Borrar', letter: 'B', synonyms: ['borrar', 'eliminar'] },
+};
+const DEFAULT_ACTION_LABEL = { display: 'Confirmar', letter: 'F', synonyms: [] };
+
+// Registra una acción pendiente y manda los botones de confirmación con la vista previa compacta.
+async function askConfirmation(ctx, { kind, preview, payload }) {
+  const id = String(++confirmationSeq);
+  const userId = ctx.from.id;
+  const action = ACTION_LABELS[kind] || DEFAULT_ACTION_LABEL;
+  // Un solo borrador pendiente por usuario a la vez: uno nuevo reemplaza al anterior en silencio
+  // (evita ambigüedad de a qué acción responde un "dale" suelto si hubiera dos abiertos).
+  const previousId = pendingConfirmationsByUser.get(userId);
+  if (previousId) pendingConfirmations.delete(previousId);
+  // Bug real encontrado en la prueba de H1 (27/07/2026): dejar que el modelo siga generando texto
+  // después de esto lo llevó a inventar "✅ Listo, confirmado y ejecutado" ANTES de que Mariano
+  // tocara ningún botón — contradice directamente la regla de "nunca declarar éxito sin poder
+  // verificarlo". No se soluciona pidiéndole más disciplina al modelo (no es confiable), se corta
+  // en el código: chatWithTools revisa esta bandera y no deja que el modelo agregue nada más.
+  if (ctx) ctx.__awaitingConfirmation = true;
+  const sentMsg = await ctx.reply(
+    `${preview}\n\n_Tipeá *${action.letter}* para ${action.display.toLowerCase()}, *C* para cancelar, o escribí una corrección._`,
+    {
+      parse_mode: 'Markdown',
+      reply_markup: {
+        inline_keyboard: [[
+          { text: `✅ ${action.display}`, callback_data: `confirm_${id}` },
+          { text: '❌ Cancelar', callback_data: `cancel_${id}` },
+        ]],
+      },
+    }
+  );
+  // Guardamos chatId/messageId (pedido de Mariano 29/07/2026): al confirmar/cancelar, en vez de
+  // borrar el borrador y reemplazarlo por un mensaje genérico, se edita ESTE mismo mensaje para
+  // sacar los botones y sumar el resultado — el borrador queda de registro visible. Necesario para
+  // el camino de confirmación por texto libre (ahí el ctx de la respuesta es un mensaje nuevo, sin
+  // referencia directa al mensaje del borrador salvo por estos IDs guardados).
+  pendingConfirmations.set(id, { kind, payload, userId, preview, action, chatId: ctx.chat.id, messageId: sentMsg.message_id });
+  pendingConfirmationsByUser.set(userId, id);
+}
+
+// Edita en el lugar el mensaje original del borrador (preview + resultado, sin botones) en vez de
+// mandar un mensaje nuevo — así el borrador queda como registro visible de lo que se hizo.
+// Devuelve false si no se pudo editar (mensaje muy viejo, etc.), para que el llamador tenga un
+// fallback de mandar un mensaje nuevo en vez de dejar a Mariano sin respuesta.
+async function finalizeDraftMessage(ctx, pending, resultLine) {
+  if (!pending.chatId || !pending.messageId) return false;
+  try {
+    await ctx.telegram.editMessageText(
+      pending.chatId, pending.messageId, undefined,
+      `${pending.preview}\n\n${resultLine}`,
+      { parse_mode: 'Markdown', reply_markup: { inline_keyboard: [] } }
+    );
+    return true;
+  } catch (error) {
+    console.error('No pude editar el mensaje del borrador original:', error.message);
+    return false;
+  }
+}
+
+// Borra un borrador pendiente de ambos índices a la vez — hay que mantenerlos sincronizados
+// siempre (confirmar, cancelar, o reemplazo por uno nuevo).
+function clearPendingConfirmation(id) {
+  const pending = pendingConfirmations.get(id);
+  if (pending && pendingConfirmationsByUser.get(pending.userId) === id) {
+    pendingConfirmationsByUser.delete(pending.userId);
+  }
+  pendingConfirmations.delete(id);
+}
+
+// Ejecuta la acción real de un borrador ya confirmado — compartido entre el botón ✅ y la
+// confirmación en lenguaje natural ("dale", "confirmalo", etc.) para no duplicar la lógica.
+async function runPendingAction({ kind, payload, userId }) {
+  let result;
+  if (kind === 'email_send') result = await gmailSend(userId, payload);
+  else if (kind === 'email_trash') {
+    const results = [];
+    for (const msgId of payload.messageIds) results.push(await gmailTrash(userId, msgId));
+    const expired = results.some((r) => r.expired);
+    const failed = results.filter((r) => !r.ok && !r.expired);
+    result = { ok: !expired && failed.length === 0, expired, error: failed.map((r) => r.error).join('; ') };
+  }
+  else if (kind === 'calendar_event') result = await calendarCreateEvent(userId, payload);
+  else if (kind === 'calendar_update') result = await calendarUpdateEvent(userId, payload);
+  else if (kind === 'calendar_delete') result = await calendarDeleteEvent(userId, payload.eventId, payload.hasAttendees);
+  else return { ok: false, error: 'Tipo de confirmación no reconocido.' };
+  return result;
+}
+
+function formatConfirmationOutcome(result) {
+  if (result.expired) return '⚠️ No pude ejecutarlo: el token de Gmail/Calendar venció. Ya te mandé el link de reautorización.';
+  if (!result.ok) return `❌ Falló: ${result.error}`;
+  return '✅ Listo, confirmado y ejecutado.';
+}
+
+bot.action(/^confirm_(\d+)$/, async (ctx) => {
+  const id = ctx.match[1];
+  const pending = pendingConfirmations.get(id);
+  await ctx.answerCbQuery();
+  if (!pending) return ctx.editMessageText('Esta confirmación ya expiró.');
+  clearPendingConfirmation(id);
+  const result = await runPendingAction(pending);
+  // Pedido de Mariano (29/07/2026): el borrador queda de registro visible, solo se sacan los
+  // botones y se suma el resultado — no se reemplaza todo por un mensaje genérico.
+  return ctx.editMessageText(`${pending.preview}\n\n${formatConfirmationOutcome(result)}`, {
+    parse_mode: 'Markdown',
+    reply_markup: { inline_keyboard: [] },
+  });
+});
+
+bot.action(/^cancel_(\d+)$/, async (ctx) => {
+  const id = ctx.match[1];
+  const pending = pendingConfirmations.get(id);
+  clearPendingConfirmation(id);
+  await ctx.answerCbQuery();
+  const previewPrefix = pending ? `${pending.preview}\n\n` : '';
+  return ctx.editMessageText(`${previewPrefix}❌ Cancelado, no se hizo nada.`, {
+    parse_mode: 'Markdown',
+    reply_markup: { inline_keyboard: [] },
+  });
+});
+
+// Clasifica una respuesta de texto libre cuando hay un borrador pendiente: confirmar/cancelar en
+// lenguaje natural, letra atajo, sinónimo específico de la acción (ver ACTION_LABELS), o corrección.
+// Match de mensaje COMPLETO (no substring) para no confundir un "sí" perdido en medio de una
+// corrección larga ("sí, pero cambiale el título") con una confirmación real.
+function classifyDraftReply(text, action) {
+  const t = text.trim().toLowerCase().replace(/[.!¡¿?]+$/, '');
+  const act = action || DEFAULT_ACTION_LABEL;
+  if (t === act.letter.toLowerCase() || act.synonyms.includes(t)) return 'confirm';
+  if (t === 'c') return 'cancel';
+  if (/^(dale|ok|okay|listo|confirmo|confirmado|hacelo|s[ií])$/.test(t)) return 'confirm';
+  if (/^(no|cancel[aá]|cancelalo|cancelala|dejalo|dejalo as[ií]|olvidalo|olvidate)$/.test(t)) return 'cancel';
+  return 'revise';
+}
+
+// ─────────────────────────────────────────
 // SYSTEM PROMPT
 // ─────────────────────────────────────────
-const SYSTEM_PROMPT = `
-Sos "OpenGravity", un asistente de inteligencia artificial de élite creado para Mariano.
-Respondé SIEMPRE en español rioplatense. Sos directo, profesional y sin rodeos.
-
-PERFIL DEL USUARIO:
-- Abogado civilista argentino (CABA y Provincia de Buenos Aires) reactivando su práctica
-- Músico y productor profesional
-- Broker de comercio internacional
-- Desarrollador de ecosistema de IA (proyecto Metatrón)
-- Emprendedor con múltiples proyectos de software en desarrollo
-- Experto en marketing digital y redes sociales
-
-TUS ÁREAS DE EXPERTISE:
-
-1. DERECHO: Derecho civil, comercial, penal y laboral argentino. CCyCN, CPCCN, CPPF, LCT.
-   Redacción de escritos, análisis de casos, estrategia procesal, jurisprudencia CSJN y SCBA.
-   Fuentes: SAIJ, InfoLeg, CIJ, JUBA.
-
-2. MÚSICA: Teoría musical, producción, arreglos, negocios musicales, licencias, distribución digital.
-
-3. BROKER / COMERCIO INTERNACIONAL: Exportación, importación, triangulación, Incoterms,
-   análisis de mercados, proveedores, precios internacionales, logística.
-
-4. INTELIGENCIA ARTIFICIAL: Conocés todo el ecosistema Metatrón de Mariano.
-   Plataformas: Claude, Gemini, GPT, Groq, OpenRouter, NotebookLM.
-   Podés ayudar a diseñar agentes, prompts, automatizaciones y flujos de trabajo.
-
-5. NEGOCIOS Y EMPRENDIMIENTO: Planes de negocio, análisis de viabilidad, estrategia,
-   modelos de monetización, pitch, inversión.
-
-6. MARKETING DIGITAL Y REDES SOCIALES: SEO, SEM, contenido, growth hacking,
-   e-commerce, funnels de venta, branding.
-
-7. DESARROLLO DE SOFTWARE: Ayudás en investigación, planificación y diseño de apps.
-   Identificás tecnologías, arquitecturas y casos de uso. Generás borradores estructurados.
-
-HERRAMIENTAS DISPONIBLES (vos decidís cuándo usarlas, con criterio propio):
-- buscar_web(query): para cualquier dato que pueda haber cambiado desde tu entrenamiento — cotizaciones, noticias, legislación vigente, jurisprudencia, precios de commodities, mercados internacionales, info de productos/empresas. Usala SIEMPRE que la pregunta dependa de info actual o específica que no tengas con certeza, incluso en preguntas de seguimiento ("compará", "profundizá", "qué cambió") — no esperes a que digan "buscá" explícitamente.
-- leer_url(url): cuando el usuario manda una URL.
-- hora_actual(): para la fecha/hora exacta. Nunca la inventes, siempre usá esta herramienta.
-
-CRITERIO DE ALCANCE GEOGRÁFICO (esto es donde más se nota si tenés criterio real o no):
-- Mariano es abogado argentino: temas de derecho, laboral, impositivo, judicial → alcance Argentina por defecto, salvo que pida otro país.
-- Commodities, mercados financieros internacionales, tecnología, productos para vender globalmente → alcance internacional, NO restrinjas a Argentina solo porque Mariano vive ahí.
-- Si la pregunta es ambigua, usá el contexto de la conversación para decidir el alcance correcto, igual que lo harías si pensaras como un asistente humano experto.
-
-REGLAS:
-- Respondé siempre en español rioplatense, sin mezclar palabras en inglés.
-- Sé directo y sin preámbulos innecesarios. Respondé exactamente lo que se pide, sin agregar info no solicitada.
-- Para temas legales: no des asesoramiento vinculante.
-- Recordás todo lo que Mariano te contó en conversaciones anteriores, pero NUNCA repitas datos de mensajes previos (hora, voz, velocidad, config) salvo que se pregunte por eso específicamente ahora.
-- NUNCA afirmes haber cambiado tu propia voz o velocidad — eso lo maneja el sistema aparte, no respondas nada sobre eso si te lo piden.
-- Cuando resumas una URL o resultado de búsqueda: hacelo en tus propias palabras (3-6 líneas), nunca copies bullets textuales.
-- Para datos específicos (montos, porcentajes, comparaciones "antes vs. después", artículos de ley): si no tenés el dato verificado por una herramienta, decilo explícitamente en vez de inventar cifras. Nunca presentes una comparación legal específica como hecho sin haberla buscado.
-`;
+// H1 (v5.1): la fuente de comportamiento pasa a ser el archivo de prompt versionado, leído una
+// sola vez al arrancar — no se reescribe a mano en el código, así queda auditable el cambio entre
+// versiones (ver changelog dentro del propio archivo).
+const SYSTEM_PROMPT = fs.readFileSync(path.join(__dirname, 'OPENGRAVITY_BOT_v5_0_H1_SYSTEM_PROMPT.md'), 'utf8');
 
 // ─────────────────────────────────────────
 // FECHA Y HORA (cálculo directo, sin IA ni web)
 // ─────────────────────────────────────────
 const TIME_KEYWORDS = ['qué hora es', 'que hora es', 'hora actual', 'hora en argentina', 'qué día es', 'que dia es', 'fecha de hoy', 'fecha actual'];
+// Si la pregunta menciona otro día relativo a hoy, no sirve el atajo directo (que solo calcula
+// "ahora") — bug real detectado 28/07/2026: "¿qué día es mañana?" contiene la keyword "qué día es"
+// como substring y el atajo respondía con la fecha de HOY, ignorando "mañana". En estos casos se
+// deja caer a la IA, que ya recibe la fecha real de hoy en el system prompt (buildSystemPromptFull).
+const RELATIVE_DAY_WORDS = ['mañana', 'manana', 'ayer', 'anteayer'];
 
 function isTimeQuery(text) {
   const t = text.toLowerCase();
+  if (RELATIVE_DAY_WORDS.some(w => t.includes(w))) return false;
   return TIME_KEYWORDS.some(k => t.includes(k));
 }
 
@@ -326,6 +762,197 @@ const TOOL_DEFS = [
       parameters: { type: 'object', properties: {} },
     },
   },
+  {
+    type: 'function',
+    function: {
+      name: 'redactar_enviar_mail',
+      description: 'Redacta un mail y lo presenta a Mariano como borrador con botones (✅ Confirmar / ❌ Cancelar) antes de enviarlo — NUNCA se envía directo, siempre pasa por este gate. Mariano también puede responder en lenguaje natural: confirmar ("dale", "enviá"), cancelar ("no", "cancelá"), o pedir una corrección en texto libre, en cuyo caso vas a recibir un mensaje pidiéndote que vuelvas a llamar esta misma herramienta con el borrador corregido. Si falta el destinatario, el asunto o el cuerpo, preguntá antes de llamar esta herramienta.',
+      parameters: {
+        type: 'object',
+        properties: {
+          to: { type: 'string', description: 'Email del destinatario.' },
+          subject: { type: 'string', description: 'Asunto del mail.' },
+          body: {
+            type: 'string',
+            description:
+              'Cuerpo del mail en texto plano. OJO con pedidos dictados por voz: la transcripción pone punto final después de cada pausa al hablar ("El cuerpo. Quiero que diga. Buenas tardes. Espero que estés bien..."), así que el cuerpo casi siempre son VARIAS oraciones seguidas, no solo la primera después de "que diga"/"que sea". Tomá TODO el texto desde ahí hasta el final del pedido (o hasta que empiece a describir otro campo, como el asunto) — un cuerpo de una sola oración corta es la excepción, no la regla; si tenés dudas de dónde termina, incluí de más antes que cortar de menos.',
+          },
+        },
+        required: ['to', 'subject', 'body'],
+      },
+    },
+  },
+  {
+    type: 'function',
+    function: {
+      name: 'leer_mails_recientes',
+      description: 'Lista los mails más recientes de la bandeja de entrada (id, remitente, asunto, primeras líneas) para que Mariano pueda pedir después que se mueva alguno a la papelera por su id. Nunca guardes el cuerpo completo en memoria, solo el resumen.',
+      parameters: {
+        type: 'object',
+        properties: { cantidad: { type: 'number', description: 'Cuántos mails traer, default 5, máximo 10.' } },
+      },
+    },
+  },
+  {
+    type: 'function',
+    function: {
+      name: 'mover_mail_papelera',
+      description: 'Mueve uno o varios mails a la papelera (recuperable ~30 días) — SIEMPRE con confirmación previa por botones (una sola confirmación por lote si son varios, no una por una), nunca borrado directo. Necesita los ids exactos (usá leer_mails_recientes primero si no los tenés).',
+      parameters: {
+        type: 'object',
+        properties: {
+          messageIds: { type: 'array', items: { type: 'string' }, description: 'IDs exactos de los mails a mover a la papelera (uno o varios).' },
+        },
+        required: ['messageIds'],
+      },
+    },
+  },
+  {
+    type: 'function',
+    function: {
+      name: 'crear_evento_calendar',
+      description: 'Crea un evento en el Calendar de Mariano. Si NO tiene invitados, se ejecuta directo sin pedir nada. Si TIENE invitados (o se están agregando/notificando invitados existentes), se pide confirmación por botones antes de ejecutar — es el mismo gate que un mail, porque pasa a ser una comunicación a terceros. Google Calendar NO permite asignar un color/etiqueta personalizado vía esta herramienta — si te lo piden, avisá la limitación, no lo inventes como hecho.',
+      parameters: {
+        type: 'object',
+        properties: {
+          summary: { type: 'string', description: 'Título del evento.' },
+          description: { type: 'string', description: 'Descripción opcional.' },
+          start: { type: 'string', description: 'Fecha/hora de inicio, formato ISO 8601 con zona horaria de Argentina (ej. 2026-07-28T10:00:00-03:00).' },
+          end: { type: 'string', description: 'Fecha/hora de fin, mismo formato.' },
+          attendees: { type: 'array', items: { type: 'string' }, description: 'Emails de invitados. Vacío o ausente si el evento es solo para Mariano.' },
+          reminderMinutes: { type: 'number', description: 'Minutos antes del evento para la notificación/alarma, opcional (ej. 15).' },
+        },
+        required: ['summary', 'start', 'end'],
+      },
+    },
+  },
+  {
+    type: 'function',
+    function: {
+      name: 'buscar_eventos_calendar',
+      description: 'Busca eventos existentes por título/texto y/o rango de fechas para conseguir su eventId. SIEMPRE llamá esta herramienta antes de editar_evento_calendar o borrar_evento_calendar cuando no tengas ya el eventId de la conversación — NUNCA le pidas el ID a Mariano, él identifica el evento por título/horario, vos lo buscás acá. Si hay un solo resultado, mostraselo y pedile que confirme que es ese antes de tocarlo. Si hay varios, mostrale la lista (título + horario) y preguntale cuál es.',
+      parameters: {
+        type: 'object',
+        properties: {
+          query: { type: 'string', description: 'Texto a buscar en título/descripción del evento (ej. "Padel Vairo"). Opcional si vas a filtrar solo por fecha.' },
+          timeMin: { type: 'string', description: 'Desde cuándo buscar, ISO 8601 con zona de Argentina. Default: ahora.' },
+          timeMax: { type: 'string', description: 'Hasta cuándo buscar, ISO 8601 con zona de Argentina. Default: 30 días desde ahora.' },
+        },
+      },
+    },
+  },
+  {
+    type: 'function',
+    function: {
+      name: 'editar_evento_calendar',
+      description: 'Edita un evento existente (título, horario, descripción, recordatorio, invitados) — necesita el eventId. Si no lo tenés, llamá primero a buscar_eventos_calendar (por título y/o fecha) y confirmá con Mariano cuál es antes de editarlo — NUNCA le pidas el ID a él. Mismo gate que crear: libre si no toca invitados, confirmación por botones si agrega/notifica invitados. Usá esta herramienta para corregir un evento ya creado — NUNCA borres y recrees un evento a mano para "editarlo", eso no es una acción real.',
+      parameters: {
+        type: 'object',
+        properties: {
+          eventId: { type: 'string', description: 'ID exacto del evento a editar (obtenido de buscar_eventos_calendar o de una respuesta anterior).' },
+          summary: { type: 'string' },
+          description: { type: 'string' },
+          start: { type: 'string', description: 'ISO 8601 con zona horaria de Argentina, solo si cambia.' },
+          end: { type: 'string', description: 'ISO 8601 con zona horaria de Argentina, solo si cambia.' },
+          attendees: { type: 'array', items: { type: 'string' }, description: 'Lista completa de invitados si cambia.' },
+          reminderMinutes: { type: 'number', description: 'Minutos antes del evento para la notificación/alarma.' },
+        },
+        required: ['eventId'],
+      },
+    },
+  },
+  {
+    type: 'function',
+    function: {
+      name: 'borrar_evento_calendar',
+      description: 'Borra un evento del Calendar (papelera de Calendar, recuperable) — SIEMPRE con confirmación previa por botones. Necesita el eventId: si no lo tenés, llamá primero a buscar_eventos_calendar (por título y/o fecha) y confirmá con Mariano cuál es antes de borrarlo — NUNCA le pidas el ID a él.',
+      parameters: {
+        type: 'object',
+        properties: {
+          eventId: { type: 'string', description: 'ID exacto del evento a borrar (obtenido de buscar_eventos_calendar o de una respuesta anterior).' },
+          tieneInvitados: { type: 'boolean', description: 'Si el evento tiene invitados (afecta si se les notifica el borrado).' },
+        },
+        required: ['eventId'],
+      },
+    },
+  },
+  {
+    type: 'function',
+    function: {
+      name: 'crear_tarea',
+      description: 'Crea un ítem en Google Tasks — sin confirmación, es una checklist personal. El campo due solo guarda fecha, nunca hora: si la instrucción menciona una hora específica, además llamá a crear_evento_calendar para esa hora.',
+      parameters: {
+        type: 'object',
+        properties: {
+          title: { type: 'string', description: 'Título de la tarea.' },
+          notes: { type: 'string', description: 'Notas opcionales.' },
+          due: { type: 'string', description: 'Fecha límite en formato ISO 8601 (solo fecha, ej. 2026-07-30T00:00:00.000Z), opcional.' },
+        },
+        required: ['title'],
+      },
+    },
+  },
+  {
+    type: 'function',
+    function: {
+      name: 'buscar_tareas',
+      description: 'Lista las tareas pendientes de Google Tasks (id, título), opcionalmente filtradas por texto del título. SIEMPRE llamá esta herramienta antes de marcar_tarea_completa cuando no tengas ya el taskId de la conversación — NUNCA le pidas el ID a Mariano, él te dice el título/tema de la tarea y vos la buscás acá. Si hay una sola coincidencia, confirmá con él que es esa antes de marcarla. Si hay varias, mostrale la lista para que elija.',
+      parameters: {
+        type: 'object',
+        properties: {
+          query: { type: 'string', description: 'Texto a buscar en el título de la tarea. Vacío para listar todas las pendientes.' },
+        },
+      },
+    },
+  },
+  {
+    type: 'function',
+    function: {
+      name: 'marcar_tarea_completa',
+      description: 'Marca un ítem de Google Tasks como completado — sin confirmación. Necesita el taskId: si no lo tenés, llamá primero a buscar_tareas y confirmá con Mariano cuál es antes de marcarla — NUNCA le pidas el ID a él.',
+      parameters: {
+        type: 'object',
+        properties: { taskId: { type: 'string', description: 'ID exacto de la tarea a marcar completa (obtenido de buscar_tareas o de una respuesta anterior).' } },
+        required: ['taskId'],
+      },
+    },
+  },
+  {
+    type: 'function',
+    function: {
+      name: 'derivar_tarea_hermes',
+      description: 'Deriva un pedido al carril de Hermes (buzón tareas_hermes) cuando necesita la PC local (filesystem, scripts) o razonamiento multi-paso pesado sin urgencia de nube — nunca para lo que vos podés resolver solo con Gmail/Calendar/Tasks. NUNCA llames esta herramienta sin tener criterio_exito y entregable ya confirmados con Mariano en el chat — si falta ese cierre, preguntá primero en vez de derivar con datos vagos.',
+      parameters: {
+        type: 'object',
+        properties: {
+          titulo: { type: 'string' },
+          instruccion: { type: 'string', description: 'Imperativa y autocontenida — Hermes no ve el chat original.' },
+          contexto: { type: 'string', description: 'Solo datos: rutas, nombres, valores.' },
+          criterio_exito: { type: 'string' },
+          entregable_tipo: { type: 'string', enum: ['archivo', 'texto', 'accion'] },
+          entregable_destino: { type: 'string' },
+          proyecto: { type: 'string', description: 'ej. general, dr_civil, broker.' },
+          prioridad: { type: 'number', description: '1 urgente, 2 normal, 3 cuando puedas.' },
+        },
+        required: ['titulo', 'instruccion', 'criterio_exito', 'entregable_tipo', 'entregable_destino'],
+      },
+    },
+  },
+  {
+    type: 'function',
+    function: {
+      name: 'derivar_tarea_project',
+      description: 'Deriva un pedido al carril de un Project específico (Dr. Civil, Bróker, etc.) cuando necesita el contexto o los archivos de ese Project — ej. un dictamen jurídico, una propuesta de negocio.',
+      parameters: {
+        type: 'object',
+        properties: {
+          proyecto: { type: 'string', description: 'Nombre del Project, ej. "Dr. Civil", "Bróker".' },
+          titulo: { type: 'string' },
+        },
+        required: ['proyecto', 'titulo'],
+      },
+    },
+  },
 ];
 
 const TOOL_HANDLERS = {
@@ -344,14 +971,195 @@ const TOOL_HANDLERS = {
     }
   },
   hora_actual: async () => `Hora actual en Argentina: ${getArgentinaDateTime()}`,
+
+  redactar_enviar_mail: async ({ to, subject, body }, ctx) => {
+    if (googleOAuthExpired) return 'El token de Gmail está vencido, pendiente de reautorización. No se puede redactar/enviar hasta que Mariano reautorice.';
+    // Bug real encontrado en vivo (29/07/2026): la transcripción de audio (Whisper) a veces come el
+    // "@gmail" de una dirección dictada ("oliveramoa@gmail.com" -> "oliveramoa.com") — armar un
+    // borrador de envío con una dirección así de rota es peor que no armarlo: hay que frenar ANTES
+    // del gate, no después, y pedirle a Mariano que confirme la dirección exacta en texto.
+    if (!/^[^\s@]+@[^\s@]+\.[^\s@]+$/.test((to || '').trim())) {
+      return `La dirección "${to}" no tiene formato de email válido (le falta el @dominio, común cuando viene de audio). Preguntale a Mariano cuál es la dirección exacta antes de armar el borrador — no llames de nuevo a esta herramienta hasta tenerla.`;
+    }
+    const primeraLinea = body.split('\n').find((l) => l.trim()) || '';
+    await askConfirmation(ctx, {
+      kind: 'email_send',
+      payload: { to, subject, body },
+      preview: `📧 *¿Envío este mail?*\n\nPara: ${to}\nAsunto: ${subject}\n\n"${primeraLinea.slice(0, 200)}"`,
+    });
+    return 'Le mostré la propuesta a Mariano con botones de confirmación — no se envió todavía.';
+  },
+
+  leer_mails_recientes: async ({ cantidad }, ctx) => {
+    if (googleOAuthExpired) return 'El token de Gmail está vencido, pendiente de reautorización.';
+    const max = Math.min(cantidad || 5, 10);
+    const listResult = await callGoogleAPI(ctx.from.id, () => gmailClient.users.messages.list({ userId: 'me', maxResults: max }));
+    if (!listResult.ok) return listResult.expired ? 'Token vencido, pendiente de reautorización.' : `Error: ${listResult.error}`;
+    const ids = (listResult.data.data.messages || []).map((m) => m.id);
+    const detalles = [];
+    for (const id of ids) {
+      const msgResult = await callGoogleAPI(ctx.from.id, () =>
+        gmailClient.users.messages.get({ userId: 'me', id, format: 'metadata', metadataHeaders: ['From', 'Subject'] })
+      );
+      if (!msgResult.ok) continue;
+      const headers = msgResult.data.data.payload?.headers || [];
+      const from = headers.find((h) => h.name === 'From')?.value || '(sin remitente)';
+      const subject = headers.find((h) => h.name === 'Subject')?.value || '(sin asunto)';
+      detalles.push(`id: ${id}\nDe: ${from}\nAsunto: ${subject}\n${(msgResult.data.data.snippet || '').slice(0, 150)}`);
+    }
+    return detalles.length ? detalles.join('\n\n') : 'No hay mails recientes.';
+  },
+
+  mover_mail_papelera: async ({ messageIds }, ctx) => {
+    if (googleOAuthExpired) return 'El token de Gmail está vencido, pendiente de reautorización.';
+    const ids = messageIds || [];
+    if (!ids.length) return 'Falta al menos un messageId.';
+    // Pedido de Mariano en la verificación de H1 (28/07/2026): con solo el id, los mails de la
+    // confirmación son imposibles de reconocer a simple vista — se trae asunto/remitente de cada
+    // uno para que la confirmación (la real, con botones) sea legible.
+    const listado = [];
+    for (const id of ids) {
+      const msgResult = await callGoogleAPI(ctx.from.id, () =>
+        gmailClient.users.messages.get({ userId: 'me', id, format: 'metadata', metadataHeaders: ['From', 'Subject'] })
+      );
+      if (!msgResult.ok) { listado.push(`• ${id} (no pude leer el detalle)`); continue; }
+      const headers = msgResult.data.data.payload?.headers || [];
+      const from = headers.find((h) => h.name === 'From')?.value || '(sin remitente)';
+      const subject = headers.find((h) => h.name === 'Subject')?.value || '(sin asunto)';
+      listado.push(`• ${subject} — ${from}\n  (id: ${id})`);
+    }
+    await askConfirmation(ctx, {
+      kind: 'email_trash',
+      payload: { messageIds: ids },
+      preview: `🗑️ *¿Muevo ${ids.length === 1 ? 'este mail' : `estos ${ids.length} mails`} a la papelera?*\n\n${listado.join('\n')}\n\n(Queda recuperable ~30 días)`,
+    });
+    return 'Le mostré la confirmación a Mariano — no se movió nada todavía.';
+  },
+
+  crear_evento_calendar: async ({ summary, description, start, end, attendees, reminderMinutes }, ctx) => {
+    if (googleOAuthExpired) return 'El token de Calendar está vencido, pendiente de reautorización.';
+    if (attendees && attendees.length) {
+      await askConfirmation(ctx, {
+        kind: 'calendar_event',
+        payload: { summary, description, start, end, attendees, reminderMinutes },
+        preview: `📅 *¿Creo este evento con invitados?*\n\n${summary}\n${start} → ${end}\nInvitados: ${attendees.join(', ')}${reminderMinutes ? `\nRecordatorio: ${reminderMinutes} min antes` : ''}`,
+      });
+      return 'Tiene invitados, le mostré la confirmación a Mariano antes de crearlo.';
+    }
+    const result = await calendarCreateEvent(ctx.from.id, { summary, description, start, end, attendees: [], reminderMinutes });
+    if (result.expired) return 'Token vencido, pendiente de reautorización.';
+    if (!result.ok) return `Error creando el evento: ${result.error}`;
+    return `Evento creado: ${summary} (${start} → ${end}), id ${result.data.data.id}.${reminderMinutes ? ` Recordatorio: ${reminderMinutes} min antes.` : ''}`;
+  },
+
+  buscar_eventos_calendar: async ({ query, timeMin, timeMax }, ctx) => {
+    if (googleOAuthExpired) return 'El token de Calendar está vencido, pendiente de reautorización.';
+    const result = await calendarSearchEvents(ctx.from.id, { query, timeMin, timeMax });
+    if (result.expired) return 'Token vencido, pendiente de reautorización.';
+    if (!result.ok) return `Error buscando eventos: ${result.error}`;
+    const items = result.data.data.items || [];
+    if (!items.length) return 'No encontré eventos que coincidan con esa búsqueda en el rango de fechas.';
+    const listado = items.map((ev) => {
+      const start = ev.start?.dateTime || ev.start?.date;
+      const end = ev.end?.dateTime || ev.end?.date;
+      const invitados = (ev.attendees || []).map((a) => a.email).join(', ');
+      return `id: ${ev.id}\nTítulo: ${ev.summary || '(sin título)'}\n${start} → ${end}${invitados ? `\nInvitados: ${invitados}` : ''}`;
+    });
+    return listado.join('\n\n');
+  },
+
+  editar_evento_calendar: async ({ eventId, summary, description, start, end, attendees, reminderMinutes }, ctx) => {
+    if (googleOAuthExpired) return 'El token de Calendar está vencido, pendiente de reautorización.';
+    if (attendees && attendees.length) {
+      await askConfirmation(ctx, {
+        kind: 'calendar_update',
+        payload: { eventId, summary, description, start, end, attendees, reminderMinutes },
+        preview: `📅 *¿Edito este evento con invitados?*\n\nID: ${eventId}${summary ? `\nTítulo: ${summary}` : ''}${start ? `\n${start} → ${end}` : ''}\nInvitados: ${attendees.join(', ')}`,
+      });
+      return 'Tiene invitados, le mostré la confirmación a Mariano antes de editarlo.';
+    }
+    const result = await calendarUpdateEvent(ctx.from.id, { eventId, summary, description, start, end, attendees, reminderMinutes });
+    if (result.expired) return 'Token vencido, pendiente de reautorización.';
+    if (!result.ok) return `Error editando el evento: ${result.error}`;
+    return `Evento editado (id ${eventId}).`;
+  },
+
+  borrar_evento_calendar: async ({ eventId, tieneInvitados }, ctx) => {
+    if (googleOAuthExpired) return 'El token de Calendar está vencido, pendiente de reautorización.';
+    await askConfirmation(ctx, {
+      kind: 'calendar_delete',
+      payload: { eventId, hasAttendees: !!tieneInvitados },
+      preview: `🗑️ *¿Borro este evento?*\n\nID: ${eventId}${tieneInvitados ? '\n⚠️ Tiene invitados, se les va a notificar el borrado.' : ''}`,
+    });
+    return 'Le mostré la confirmación a Mariano — no se borró todavía.';
+  },
+
+  crear_tarea: async ({ title, notes, due }, ctx) => {
+    if (googleOAuthExpired) return 'El token de Tasks está vencido, pendiente de reautorización.';
+    const result = await tasksCreate(ctx.from.id, { title, notes, due });
+    if (result.expired) return 'Token vencido, pendiente de reautorización.';
+    if (!result.ok) return `Error creando la tarea: ${result.error}`;
+    return `Tarea creada: "${title}"${due ? ` (vence ${due.slice(0, 10)})` : ''}. Recordá: due no guarda hora, si hace falta hora exacta hay que crear también un evento de Calendar.`;
+  },
+
+  buscar_tareas: async ({ query }, ctx) => {
+    if (googleOAuthExpired) return 'El token de Tasks está vencido, pendiente de reautorización.';
+    const result = await tasksSearch(ctx.from.id, { query });
+    if (result.expired) return 'Token vencido, pendiente de reautorización.';
+    if (!result.ok) return `Error buscando tareas: ${result.error}`;
+    const items = result.data.data.items || [];
+    if (!items.length) return 'No encontré tareas pendientes que coincidan con esa búsqueda.';
+    return items.map((t) => `id: ${t.id}\nTítulo: ${t.title}`).join('\n\n');
+  },
+
+  marcar_tarea_completa: async ({ taskId }, ctx) => {
+    if (googleOAuthExpired) return 'El token de Tasks está vencido, pendiente de reautorización.';
+    const result = await tasksComplete(ctx.from.id, taskId);
+    if (result.expired) return 'Token vencido, pendiente de reautorización.';
+    if (!result.ok) return `Error marcando la tarea: ${result.error}`;
+    return 'Tarea marcada como completa.';
+  },
+
+  // El carril "Project" (buzón Drive por carpeta) necesita el scope de Drive, que NO está entre
+  // los 4 scopes mínimos autorizados en Paso 1 de H1 (gmail.send, gmail.modify, calendar.events,
+  // tasks) — agregarlo implica repetir todo el consent screen. Se deja el tool para que el modelo
+  // pueda reconocer el pedido y avisar la limitación real en vez de fingir que lo hizo (Lección Gordon).
+  derivar_tarea_project: async ({ proyecto, titulo }) => {
+    return `No puedo derivar todavía al carril de Project ("${proyecto}: ${titulo}") — escribir en el buzón de Drive de los Projects necesita un scope de Google Drive que no está autorizado en este hito (H1 solo pidió Gmail/Calendar/Tasks). Es una limitación real, no un error: hay que agregar el scope y repetir el consent screen si se quiere habilitar esto.`;
+  },
+
+  derivar_tarea_hermes: async ({ titulo, instruccion, contexto, criterio_exito, entregable_tipo, entregable_destino, proyecto, prioridad }) => {
+    if (!criterio_exito || !entregable_destino) {
+      return 'Falta criterio_exito y/o entregable confirmados con Mariano — preguntale antes de derivar, no se creó la tarea.';
+    }
+    const doc = {
+      esquema: 1,
+      estado: 'pendiente',
+      titulo,
+      instruccion,
+      contexto: contexto || '',
+      criterio_exito,
+      entregable: { tipo: entregable_tipo || 'texto', destino: entregable_destino },
+      proyecto: proyecto || 'general',
+      prioridad: prioridad || 2,
+      creada: new Date().toISOString(),
+      creada_por: 'bot',
+      actualizada: new Date().toISOString(),
+      intentos: 0,
+      resultado: null,
+    };
+    const ref = await db.collection('tareas_hermes').add(doc);
+    await logAccion({ accion: 'derivar_tarea_hermes', destinatario_o_archivo: ref.id, confirmada: true, resultado: `creada: ${titulo}` });
+    return `Tarea derivada a Hermes (id ${ref.id}): "${titulo}".`;
+  },
 };
 
-async function executeToolCall(toolCall) {
+async function executeToolCall(toolCall, ctx) {
   const fn = TOOL_HANDLERS[toolCall.function.name];
   if (!fn) return 'Herramienta no reconocida.';
   try {
     const args = JSON.parse(toolCall.function.arguments || '{}');
-    return await fn(args);
+    return await fn(args, ctx);
   } catch (error) {
     console.error(`Error ejecutando ${toolCall.function.name}:`, error.message);
     return `Error al ejecutar la herramienta: ${error.message}`;
@@ -368,7 +1176,69 @@ function cleanMessages(messages) {
 }
 
 // Llama al endpoint OpenAI-compatible con soporte de tool-calling, resolviendo hasta 2 rondas de herramientas
-async function chatWithTools(url, apiKey, model, messages, onToolNotice) {
+// Sentinel devuelto cuando una herramienta gateada (Gmail/Calendar con invitados) ya mandó su
+// propia UI de confirmación — distinto de null (que en callAIWithTimeout significa "timeout").
+const GATED_NO_REPLY = '__GATED_NO_REPLY__';
+
+// Heurísticas determinísticas (no dependen del modelo) para detectar que el modelo narró en
+// texto libre algo que debía ser una llamada real a herramienta — ver comentario de uso más abajo.
+//
+// Firma 1: botones inventados. Los botones reales de askConfirmation viven en el reply_markup de
+// Telegram, JAMÁS como glifos dentro del texto del mensaje (los preview de askConfirmation usan
+// 📧/🗑️/📅, nunca ✅/❌ — confirmado grep sobre el código). Bug real visto en vivo (29/07/2026,
+// captura de Mariano): el modelo escribió "✅ Mover a papelera  ❌ Cancelar" como texto plano no
+// clickeable en vez de llamar a mover_mail_papelera. La versión anterior de esta firma exigía
+// además la palabra "confirm" en el texto — ese caso real no la tenía ("pulsá el botón
+// correspondiente"), así que no se detectó. Ahora alcanza con que aparezcan los dos glifos juntos.
+function looksLikeFakeActionConfirmation(text) {
+  if (!text) return false;
+  return text.includes('✅') && text.includes('❌');
+}
+
+// Firma 2: acción gateada declarada como YA HECHA sin haber pasado por el gate real. Por
+// construcción de chatWithTools: si askConfirmation se llamó de verdad en esta misma conversación,
+// la función corta con GATED_NO_REPLY antes de llegar nunca a esta rama de texto final sin
+// tool_calls (ver el corte más abajo). redactar_enviar_mail, mover_mail_papelera y
+// borrar_evento_calendar SIEMPRE gatean, sin excepción — no existe un camino legítimo en el que el
+// texto final declare enviado/movido/borrado sin que el gate real haya disparado antes. Si llegamos
+// acá con esa declaración, es inventado. Deliberadamente NO incluye crear/editar/completar (esas sí
+// tienen caminos legítimos sin gate cuando no hay invitados).
+function looksLikeFakeCompletedGatedAction(text) {
+  if (!text) return false;
+  const completedPhrase = /\b(ya\s+(lo\s+|la\s+)?(borr[eé]|elimin[eé]|mov[ií]|envi[eé])|borrad[oa]|eliminad[oa]|movid[oa]\s+a\s+la\s+papelera|enviad[oa])\b/i;
+  const actionNoun = /\b(mail|correo|evento|papelera)\b/i;
+  return completedPhrase.test(text) && actionNoun.test(text);
+}
+
+// Filtro defensivo contra el canal "analysis" (razonamiento oculto) de gpt-oss filtrándose al
+// content final — bug documentado upstream, no nuestro (ver handoff 30/07/2026). Visto una vez en
+// vivo: la respuesta arrancó con ". We can say that editing drafts is not within current
+// capabilities... So respond accordingly." antes del texto en español real. Deliberadamente
+// conservador para no arriesgar cortar contenido legítimo: solo actúa sobre señales muy
+// específicas del glitch (tokens de control literales del formato "harmony", o el patrón exacto
+// de arrancar con un punto suelto seguido de una frase en inglés) — cualquier otra cosa la deja
+// intacta, aunque eso signifique no atrapar variantes que todavía no vimos.
+function stripLeakedReasoningPreamble(text) {
+  if (!text) return text;
+  let cleaned = text;
+  // Tokens de control del formato harmony que a veces sobreviven al parseo del proveedor.
+  cleaned = cleaned.replace(/<\|(?:start|end|channel|message|return|call)\|>[a-z]*/gi, '').trim();
+  // Patrón exacto visto en vivo: arranca con un punto suelto + una oración en inglés de
+  // meta-razonamiento, antes del texto en español real.
+  const leakMatch = cleaned.match(/^\.\s*([A-Z][^.!?]*[.!?]\s*)+/);
+  if (leakMatch) {
+    const preamble = leakMatch[0];
+    const rest = cleaned.slice(preamble.length).trim();
+    const spanishSignal = /[áéíóúñ¿¡]/;
+    const englishMarker = /\b(we can|we should|we must|so respond|respond accordingly|current capabilities|the user|i (?:should|must|will))\b/i;
+    if (rest && !spanishSignal.test(preamble) && englishMarker.test(preamble)) {
+      cleaned = rest;
+    }
+  }
+  return cleaned;
+}
+
+async function chatWithTools(url, apiKey, model, messages, onToolNotice, ctx) {
   const headers = { 'Content-Type': 'application/json', Authorization: `Bearer ${apiKey}` };
   let convo = [...messages];
   // Diagnóstico temporal (ver [[opengravity-bot-latencia]]): sin esto, agotar las rondas de
@@ -381,14 +1251,36 @@ async function chatWithTools(url, apiKey, model, messages, onToolNotice) {
   for (let round = 0; round < 3; round++) {
     const response = await axios.post(
       url,
-      { model, messages: convo, temperature: 0.5, tools: TOOL_DEFS, tool_choice: 'auto' },
+      {
+        model, messages: convo, temperature: 0.5, tools: TOOL_DEFS, tool_choice: 'auto',
+        // gpt-oss (120b/20b) es un modelo de razonamiento: pide un canal "analysis" oculto antes
+        // del canal "final". Bug documentado upstream (Groq/vLLM/OpenRouter, no nuestro): a veces
+        // ese canal oculto se filtra al content visible (visto en vivo 29/07/2026, fragmento en
+        // inglés antes del texto en español real). Pedir reasoning:false reduce la frecuencia al
+        // no generar ese canal para empezar — no lo garantiza al 100%, por eso además queda el
+        // filtro defensivo de stripLeakedReasoningPreamble() más abajo.
+        ...(providerLabel === 'openrouter' ? { reasoning: { enabled: false } } : {}),
+      },
       { headers, timeout: 30000 }
     );
     const msg = response.data.choices[0].message;
 
     if (!msg.tool_calls || !msg.tool_calls.length) {
       console.log(`[chatWithTools] ${providerLabel}/${model} ronda ${round + 1}/3: respuesta final sin tool_calls.`);
-      return msg.content;
+      // Red de seguridad de código (no solo prompt): encontrado en vivo (28/07/2026) que incluso
+      // el modelo default a veces, sin llamar ninguna herramienta, escribe en texto libre una
+      // "confirmación" con ✅/❌ que no es un botón real — pasó con papelera en lote y con un plan
+      // inventado de "borro y creo de nuevo" un evento. No confiamos en que el modelo se autocorrija:
+      // si el texto tiene la firma de una confirmación de acción falsa, se bloquea acá mismo.
+      if (looksLikeFakeActionConfirmation(msg.content) || looksLikeFakeCompletedGatedAction(msg.content)) {
+        console.log(`[chatWithTools] ${providerLabel}/${model} ronda ${round + 1}/3: respuesta bloqueada por firma de confirmación/acción falsa: ${JSON.stringify(msg.content?.slice(0, 200))}`);
+        return 'No pude armar esa acción de forma segura. Pedímelo de nuevo mencionando una sola acción concreta por vez (ej. "mové a la papelera el mail con id X", o "editá el evento con id Y") y debería funcionar.';
+      }
+      const cleanContent = stripLeakedReasoningPreamble(msg.content);
+      if (cleanContent !== msg.content) {
+        console.log(`[chatWithTools] ${providerLabel}/${model} ronda ${round + 1}/3: preámbulo de razonamiento filtrado cortado: ${JSON.stringify(msg.content?.slice(0, 200))}`);
+      }
+      return cleanContent;
     }
 
     lastToolNames = msg.tool_calls.map(tc => `${tc.function.name}(${tc.function.arguments})`);
@@ -398,10 +1290,17 @@ async function chatWithTools(url, apiKey, model, messages, onToolNotice) {
 
     convo.push({ role: 'assistant', content: msg.content || null, tool_calls: msg.tool_calls });
     for (const tc of msg.tool_calls) {
-      const result = await executeToolCall(tc);
+      const result = await executeToolCall(tc, ctx);
       const resultStr = String(result);
       console.log(`[chatWithTools] ${providerLabel}/${model} ronda ${round + 1}/3: resultado de ${tc.function.name} (${resultStr.length} chars): ${resultStr.slice(0, 300)}`);
       convo.push({ role: 'tool', tool_call_id: tc.id, content: resultStr.slice(0, 4000) });
+    }
+    // Corte duro (no depende del modelo, ver comentario en askConfirmation): si esta ronda dejó
+    // una confirmación pendiente, no seguimos pidiéndole al modelo una respuesta final — evita
+    // que invente que la acción ya se ejecutó cuando en realidad está esperando el botón.
+    if (ctx?.__awaitingConfirmation) {
+      ctx.__awaitingConfirmation = false;
+      return GATED_NO_REPLY; // sentinel, no null: null ya significa "timeout" en callAIWithTimeout
     }
   }
   console.log(`[chatWithTools] ${providerLabel}/${model}: se quedó sin rondas. Último intento: ${lastToolNames.join(', ') || 'ninguno'}`);
@@ -430,7 +1329,7 @@ function classifyAIError(error) {
   return 'error_desconocido';
 }
 
-async function callAI(messages, config, onToolNotice, userId) {
+async function callAI(messages, config, onToolNotice, userId, ctx) {
   const headers = { 'Content-Type': 'application/json' };
   // Groq retirado de la cadena de chat: se da de baja el 16/08/2026 (auditoría Fable, ítem 73).
   // OpenRouter queda como único proveedor de chat. La transcripción de audio (Whisper, en
@@ -450,7 +1349,7 @@ async function callAI(messages, config, onToolNotice, userId) {
 
   if (process.env.OPENROUTER_API_KEY) {
     try {
-      return await chatWithTools('https://openrouter.ai/api/v1/chat/completions', process.env.OPENROUTER_API_KEY, model, clean, onToolNotice);
+      return await chatWithTools('https://openrouter.ai/api/v1/chat/completions', process.env.OPENROUTER_API_KEY, model, clean, onToolNotice, ctx);
     } catch (error) {
       const detail = error.response?.data?.error?.message || error.message;
       console.error('Error OpenRouter:', detail);
@@ -462,7 +1361,7 @@ async function callAI(messages, config, onToolNotice, userId) {
   // modelo liviano y estable, pero vía OpenRouter (auditoría Fable, ítem 73).
   if (process.env.OPENROUTER_API_KEY && model !== 'openai/gpt-oss-20b') {
     try {
-      return await chatWithTools('https://openrouter.ai/api/v1/chat/completions', process.env.OPENROUTER_API_KEY, 'openai/gpt-oss-20b', clean, onToolNotice);
+      return await chatWithTools('https://openrouter.ai/api/v1/chat/completions', process.env.OPENROUTER_API_KEY, 'openai/gpt-oss-20b', clean, onToolNotice, ctx);
     } catch (error) {
       const detail = error.response?.data?.error?.message || error.message;
       console.error('Error fallback gpt-oss-20b:', detail);
@@ -475,7 +1374,7 @@ async function callAI(messages, config, onToolNotice, userId) {
   const alreadyTried = (p, m) => attempts.some(a => a.provider === p && a.model === m) || (provider === p && model === m);
   if (process.env.OPENROUTER_API_KEY && !alreadyTried('openrouter', 'nvidia/nemotron-3-nano-30b-a3b:free')) {
     try {
-      return await chatWithTools('https://openrouter.ai/api/v1/chat/completions', process.env.OPENROUTER_API_KEY, 'nvidia/nemotron-3-nano-30b-a3b:free', clean, onToolNotice);
+      return await chatWithTools('https://openrouter.ai/api/v1/chat/completions', process.env.OPENROUTER_API_KEY, 'nvidia/nemotron-3-nano-30b-a3b:free', clean, onToolNotice, ctx);
     } catch (error) {
       const detail = error.response?.data?.error?.message || error.message;
       console.error('Error fallback Nemotron-nano:', detail);
@@ -487,7 +1386,7 @@ async function callAI(messages, config, onToolNotice, userId) {
   // devuelve 429 por rate-limit upstream — se deja igual porque puede recuperarse y es mejor que no intentar nada).
   if (process.env.OPENROUTER_API_KEY && !alreadyTried('openrouter', 'google/gemma-4-31b-it:free')) {
     try {
-      return await chatWithTools('https://openrouter.ai/api/v1/chat/completions', process.env.OPENROUTER_API_KEY, 'google/gemma-4-31b-it:free', clean, onToolNotice);
+      return await chatWithTools('https://openrouter.ai/api/v1/chat/completions', process.env.OPENROUTER_API_KEY, 'google/gemma-4-31b-it:free', clean, onToolNotice, ctx);
     } catch (error) {
       const detail = error.response?.data?.error?.message || error.message;
       console.error('Error fallback Gemma:', detail);
@@ -561,6 +1460,24 @@ async function textToSpeech(text, userId) {
 // ─────────────────────────────────────────
 // TRANSCRIPCIÓN DE AUDIO
 // ─────────────────────────────────────────
+// Normaliza direcciones de email dictadas por voz: Whisper (STT) se come el "@" o lo transcribe
+// como la palabra "arroba" suelta, o como un punto — bug real visto en vivo (29/07/2026):
+// "oliveramoa@gmail.com" dictado salió como "oliveramoa.gmail.com" y como "oliveramoa.com" en
+// intentos distintos, ni el prompt de biasing de Whisper alcanzó a corregirlo solo. Se corrige acá
+// con reglas determinísticas, antes de que el texto llegue a la IA — no depende de que el modelo
+// "adivine" la dirección correcta.
+function normalizeSpokenEmail(text) {
+  let out = text.replace(/\s+arroba\s+/gi, '@');
+  // "nombre.gmail.com" o "nombre gmail com" (separador punto/espacio en vez de @) -> "nombre@gmail.com".
+  // Un email ya bien transcripto ("nombre@gmail.com") no matchea esto porque el separador acá es
+  // literalmente "@", no un punto ni un espacio.
+  out = out.replace(
+    /\b([a-z0-9._-]+)[.\s]+(gmail|hotmail|outlook|yahoo|icloud|live)[.\s]+com\b/gi,
+    '$1@$2.com'
+  );
+  return out;
+}
+
 async function transcribeAudio(fileUrl) {
   try {
     console.log(`[transcribeAudio] descarga arranca: ${new Date().toISOString()}`);
@@ -572,6 +1489,10 @@ async function transcribeAudio(fileUrl) {
     const formData = new FormData();
     formData.append('file', fs.createReadStream(tempPath));
     formData.append('model', 'whisper-large-v3');
+    formData.append('language', 'es');
+    // "Prompt" de Whisper: no es una instrucción, es texto de referencia que sesga el vocabulario
+    // esperado — ayuda (no garantiza) a que reconozca "arroba" y direcciones de Gmail dictadas.
+    formData.append('prompt', 'Dirección de correo con arroba, por ejemplo nombre arroba gmail punto com.');
     console.log(`[transcribeAudio] llamada a Whisper (Groq) arranca: ${new Date().toISOString()}`);
     const res = await axios.post(
       'https://api.groq.com/openai/v1/audio/transcriptions',
@@ -583,7 +1504,7 @@ async function transcribeAudio(fileUrl) {
     );
     console.log(`[transcribeAudio] llamada a Whisper (Groq) termina: ${new Date().toISOString()}`);
     fs.unlinkSync(tempPath);
-    return res.data.text;
+    return normalizeSpokenEmail(res.data.text);
   } catch (error) {
     console.error('Error transcribiendo audio:', error.message);
     return null;
@@ -656,11 +1577,34 @@ function buildModelCatalogText() {
   return out.trim();
 }
 
-// System prompt completo: base + catálogo de modelos, para que el modelo pueda recomendar el más adecuado si le preguntan
-const SYSTEM_PROMPT_FULL = `${SYSTEM_PROMPT}
+// System prompt completo: base + catálogo de modelos + recordatorio operativo de tool-calling.
+// El recordatorio se agrega acá (no en el .md versionado) porque nace de un bug real encontrado
+// en la verificación de H1 (28/07/2026): el modelo, imitando turnos viejos guardados en su
+// historial de Firestore (de antes de existir el gate en código), a veces escribe en texto libre
+// una confirmación con botones falsos en vez de llamar a la herramienta real — el usuario ve
+// "botones" que en realidad son texto sin clickear, sin ninguna acción real detrás.
+const SYSTEM_PROMPT_STATIC = `${SYSTEM_PROMPT}
 
 CATÁLOGO DE MODELOS DISPONIBLES (si te preguntan qué modelo conviene para una tarea, respondé con criterio usando esta info):
-${buildModelCatalogText()}`;
+${buildModelCatalogText()}
+
+REGLA OPERATIVA DURA (no negociable, aplica siempre): para redactar/enviar mails, mover mails a la papelera, crear/editar/borrar eventos de Calendar, o crear/marcar tareas de Tasks, SIEMPRE llamá a la herramienta correspondiente (redactar_enviar_mail, mover_mail_papelera, crear_evento_calendar, editar_evento_calendar, borrar_evento_calendar, crear_tarea, marcar_tarea_completa). NUNCA describas en texto libre una confirmación, una vista previa con botones, o un resultado de esas acciones — los botones reales y la ejecución real los maneja el código, no vos. Si en tu historial de conversación ves turnos anteriores donde "vos" escribiste una confirmación en texto en vez de usar la herramienta, es un error viejo — no lo repitas ni lo imites. Si te piden algo que ninguna herramienta puede hacer de verdad (ej. un color/etiqueta de evento), decilo explícitamente — nunca inventes un plan alternativo (como "borro y creo de nuevo") narrado en texto: si existe una herramienta para lo que hace falta (ej. editar_evento_calendar), usala; si no existe, avisá la limitación real.
+
+REGLA OPERATIVA DURA — editar/borrar eventos de Calendar (no negociable, aplica siempre): para editar_evento_calendar o borrar_evento_calendar NUNCA le pidas el eventId a Mariano — es información interna de Google Calendar, engorrosa de conseguir a mano y no es su trabajo dártela. Si no tenés ya el eventId (por ejemplo porque vos mismo creaste el evento en este mismo chat), llamá primero a buscar_eventos_calendar con el título y/o fecha que Mariano te dio. Si aparece un solo resultado, mostraselo (título + horario) y pedile que confirme que es ese evento antes de editarlo o borrarlo. Si aparecen varios, mostrale la lista para que elija. Recién con la confirmación de Mariano usás el eventId real para editar_evento_calendar o borrar_evento_calendar.
+
+REGLA OPERATIVA DURA — marcar tareas de Tasks como completas (mismo criterio que Calendar, no negociable): para marcar_tarea_completa NUNCA le pidas el taskId a Mariano. Si no lo tenés ya, llamá primero a buscar_tareas con el título/tema que te dio. Si aparece una sola coincidencia, confirmá con él que es esa tarea antes de marcarla. Si aparecen varias, mostrale la lista para que elija. Recién con su confirmación usás el taskId real para marcar_tarea_completa.
+
+REGLA OPERATIVA DURA — no confundir redactar_enviar_mail con mover_mail_papelera (bug real visto en vivo 29/07/2026): son operaciones OPUESTAS y no relacionadas — redactar_enviar_mail crea y manda un mail NUEVO que Mariano está dictando/escribiendo ahora; mover_mail_papelera borra un mail YA EXISTENTE en la bandeja de entrada. Si Mariano te pide "enviá un mail", "mandale un mail a X", o te dicta destinatario/asunto/cuerpo, es SIEMPRE redactar_enviar_mail — nunca mover_mail_papelera, aunque la dirección de destino te llegue con formato raro (típico de audio transcripto, ej. "nombre.com" en vez de "nombre@gmail.com"). Si la dirección no tiene forma de email válida, la herramienta te va a avisar — en ese caso preguntale a Mariano la dirección exacta en vez de inventar una acción distinta.`;
+
+// Se recalcula en cada turno (no es una constante fija) porque el contenedor de Cloud Run puede
+// quedar levantado horas o reiniciarse a mitad de la noche — si la fecha/hora quedara fija al
+// arrancar el proceso, el modelo calculaba mal "hoy"/"mañana" (bug real detectado 28/07/2026:
+// pedido a la noche del 27/07 para "mañana" resultó en un evento creado el 29/07 en vez del 28/07).
+function buildSystemPromptFull() {
+  return `${SYSTEM_PROMPT_STATIC}
+
+FECHA Y HORA ACTUAL EN ARGENTINA (usá esto como referencia exacta para calcular "hoy", "mañana", "el lunes que viene", etc. — nunca la infieras de otra forma): ${getArgentinaDateTime()}.`;
+}
 
 // ─────────────────────────────────────────
 // PARSEO DE COMANDOS DE CONFIGURACIÓN
@@ -843,11 +1787,12 @@ bot.command('buscar', async (ctx) => {
   const config = await getConfig(ctx.from.id);
   const history = await getHistory(ctx.from.id);
   const messages = [
-    { role: 'system', content: SYSTEM_PROMPT_FULL },
+    { role: 'system', content: buildSystemPromptFull() },
     ...history,
     { role: 'user', content: `${query}\n\nResultados web:\n${results}` },
   ];
-  const aiReply = await callAIWithTimeout(messages, config, null, ctx.from.id);
+  const aiReply = await callAIWithTimeout(messages, config, null, ctx.from.id, ctx);
+  if (aiReply === GATED_NO_REPLY) return; // ya se mandó la UI de confirmación, no hay nada más que responder
   await saveMessage(ctx.from.id, 'user', `/buscar ${query}`);
   await saveMessage(ctx.from.id, 'assistant', aiReply);
   await replyWithAudio(ctx, aiReply);
@@ -875,8 +1820,8 @@ function withTimeout(promise, ms) {
 // de audio (hasta ~15-30s en el caso de mensajes de voz) antes, y TTS + envío de la nota de voz (hasta
 // ~15-20s) después. Un valor más alto (se probó 65s) dejaba pasar el TTS fuera del handlerTimeout de 90s.
 const AI_TIMEOUT_MS = 40000;
-async function callAIWithTimeout(messages, config, onToolNotice, userId) {
-  const result = await withTimeout(callAI(messages, config, onToolNotice, userId), AI_TIMEOUT_MS);
+async function callAIWithTimeout(messages, config, onToolNotice, userId, ctx) {
+  const result = await withTimeout(callAI(messages, config, onToolNotice, userId, ctx), AI_TIMEOUT_MS);
   return result === null ? 'Perdón, tardé demasiado en responder. Probá de nuevo o reformulá la pregunta.' : result;
 }
 
@@ -907,6 +1852,43 @@ async function replyWithAudio(ctx, text) {
 // Procesa un mensaje de usuario (de texto o transcripto de audio) y responde con texto + audio.
 async function handleUserText(ctx, text) {
   const userId = ctx.from.id;
+
+  // ── Borrador pendiente de confirmación (Gmail/Calendar) — ciclo iterativo en lenguaje natural,
+  // ver askConfirmation. Se chequea antes que cualquier otra cosa: mientras hay un borrador
+  // esperando, toda respuesta de Mariano es sobre ESE borrador, no un mensaje nuevo y suelto.
+  const pendingId = pendingConfirmationsByUser.get(userId);
+  if (pendingId) {
+    const pending = pendingConfirmations.get(pendingId);
+    const intent = classifyDraftReply(text, pending.action);
+    if (intent === 'confirm') {
+      clearPendingConfirmation(pendingId);
+      const outcomeLine = formatConfirmationOutcome(await runPendingAction(pending));
+      const edited = await finalizeDraftMessage(ctx, pending, outcomeLine);
+      return edited ? undefined : ctx.reply(outcomeLine);
+    }
+    if (intent === 'cancel') {
+      clearPendingConfirmation(pendingId);
+      const edited = await finalizeDraftMessage(ctx, pending, '❌ Cancelado, no se hizo nada.');
+      return edited ? undefined : ctx.reply('Cancelado, no se hizo nada.');
+    }
+    // Corrección en lenguaje natural: se la pasamos a la IA con el borrador actual como contexto
+    // explícito para que vuelva a llamar la misma herramienta con los cambios aplicados — eso
+    // genera un askConfirmation nuevo (nuevos botones) y el ciclo se repite tantas veces como haga falta.
+    clearPendingConfirmation(pendingId);
+    const config = await getConfig(userId);
+    const history = await getHistory(userId);
+    await saveMessage(userId, 'user', text);
+    const revisionPrompt = `Mariano pidió un cambio sobre el borrador pendiente que le mostraste (${pending.kind}):\n${pending.preview}\n\nCambio pedido: "${text}"\n\nVolvé a armar la acción completa con este cambio aplicado y llamá otra vez a la herramienta correspondiente con el borrador corregido — no le vuelvas a preguntar datos que ya tenías antes de este cambio.`;
+    const revisionMessages = [
+      { role: 'system', content: buildSystemPromptFull() },
+      ...history,
+      { role: 'user', content: revisionPrompt },
+    ];
+    const revisionReply = await callAIWithTimeout(revisionMessages, config, null, userId, ctx);
+    if (revisionReply === GATED_NO_REPLY) return;
+    await saveMessage(userId, 'assistant', revisionReply);
+    return replyWithAudio(ctx, revisionReply);
+  }
 
   // ── Confirmación pendiente de una idea detectada en el mensaje anterior ──
   if (pendingIdeas.has(userId)) {
@@ -1014,7 +1996,7 @@ async function handleUserText(ctx, text) {
 
   await saveMessage(userId, 'user', text);
   const messages = [
-    { role: 'system', content: SYSTEM_PROMPT_FULL },
+    { role: 'system', content: buildSystemPromptFull() },
     ...history,
     { role: 'user', content: text },
   ];
@@ -1028,7 +2010,8 @@ async function handleUserText(ctx, text) {
     else if (names.includes('leer_url')) await ctx.reply('🌐 Leyendo el enlace...');
   };
 
-  const aiReply = await callAIWithTimeout(messages, config, onToolNotice, userId);
+  const aiReply = await callAIWithTimeout(messages, config, onToolNotice, userId, ctx);
+  if (aiReply === GATED_NO_REPLY) return; // ya se mandó la UI de confirmación, no hay nada más que responder
   await saveMessage(userId, 'assistant', aiReply);
   await replyWithAudio(ctx, aiReply);
 }
@@ -1111,11 +2094,12 @@ bot.on('document', async (ctx) => {
     const history = await getHistory(userId);
     const userPrompt = `Resumí los puntos clave de este documento ("${fileName}"):\n\n${text.slice(0, 8000)}`;
     const messages = [
-      { role: 'system', content: SYSTEM_PROMPT_FULL },
+      { role: 'system', content: buildSystemPromptFull() },
       ...history,
       { role: 'user', content: userPrompt },
     ];
-    const aiReply = await callAIWithTimeout(messages, config, null, userId);
+    const aiReply = await callAIWithTimeout(messages, config, null, userId, ctx);
+    if (aiReply === GATED_NO_REPLY) return; // ya se mandó la UI de confirmación, no hay nada más que responder
     await saveMessage(userId, 'user', `[documento] ${fileName}`);
     await saveMessage(userId, 'assistant', aiReply);
     await replyWithAudio(ctx, aiReply);
@@ -1149,6 +2133,73 @@ async function testOpenRouter() {
   }
 }
 
+// A3: ping a CADA modelo del catálogo (no solo el default), al arranque y en el job de las 9hs —
+// si alguno falla, se avisa en vez de fallar en silencio (mismo criterio de testOpenRouter()).
+async function pingAllCatalogModels() {
+  const results = [];
+  for (const model of Object.keys(MODELS_BY_PROVIDER.openrouter.models)) {
+    try {
+      await axios.post('https://openrouter.ai/api/v1/chat/completions',
+        { model, messages: [{ role: 'user', content: 'di hola' }], max_tokens: 50 },
+        { headers: { Authorization: `Bearer ${process.env.OPENROUTER_API_KEY}`, 'Content-Type': 'application/json' }, timeout: 15000 }
+      );
+      results.push({ model, ok: true });
+    } catch (e) {
+      results.push({ model, ok: false, detail: e.response?.data?.error?.message || e.message });
+    }
+  }
+  return results;
+}
+
+// ─────────────────────────────────────────
+// AVISO DIARIO 9HS ART — resumen de los 3 carriles (+ estado del token de Gmail, ítem 88)
+// ─────────────────────────────────────────
+async function buildDailyBrief(userId) {
+  const desde = new Date(Date.now() - 24 * 60 * 60 * 1000).toISOString();
+
+  const logSnap = await db.collection('log_acciones').where('timestamp', '>=', desde).get();
+  const acciones = logSnap.docs.map((d) => d.data());
+  const resumenAcciones = acciones.length
+    ? acciones.map((a) => `• ${a.accion} → ${a.destinatario_o_archivo} (${a.resultado})`).join('\n')
+    : 'Sin acciones registradas en las últimas 24hs.';
+
+  const hermesSnap = await db.collection('tareas_hermes').where('estado', '==', 'pendiente').get();
+  let hermesTexto = `Hermes: ${hermesSnap.size} pendientes.`;
+  if (hermesSnap.size > 0) {
+    const masVieja = hermesSnap.docs.reduce((a, b) => (a.data().creada < b.data().creada ? a : b));
+    const dias = Math.floor((Date.now() - new Date(masVieja.data().creada).getTime()) / (24 * 60 * 60 * 1000));
+    hermesTexto += ` La más vieja tiene ${dias} día(s).`;
+  }
+
+  let calendarTexto = 'no disponible (token vencido, pendiente de reautorización).';
+  if (!googleOAuthExpired) {
+    const hoyInicio = new Date(); hoyInicio.setHours(0, 0, 0, 0);
+    const hoyFin = new Date(); hoyFin.setHours(23, 59, 59, 999);
+    const evResult = await callGoogleAPI(userId, () =>
+      calendarClient.events.list({ calendarId: 'primary', timeMin: hoyInicio.toISOString(), timeMax: hoyFin.toISOString(), singleEvents: true, orderBy: 'startTime' })
+    );
+    calendarTexto = evResult.ok
+      ? (evResult.data.data.items.length ? evResult.data.data.items.map((e) => `• ${e.summary} (${e.start.dateTime || e.start.date})`).join('\n') : 'sin eventos hoy.')
+      : `error consultando Calendar: ${evResult.error}`;
+  }
+
+  const modelPings = await pingAllCatalogModels();
+  const modelosFallando = modelPings.filter((m) => !m.ok);
+  const modelosTexto = modelosFallando.length
+    ? `⚠️ Fallando: ${modelosFallando.map((m) => `${m.model} (${m.detail})`).join('; ')}`
+    : 'todos los modelos del catálogo responden OK.';
+
+  return (
+    `📋 *Aviso diario — ${getArgentinaDateTime()}*\n\n` +
+    `*Bot (ayer):*\n${resumenAcciones}\n\n` +
+    `*Hermes:*\n${hermesTexto}\n\n` +
+    `*Projects:*\nno disponible en H1 (requiere scope de Drive, fuera de alcance de este hito).\n\n` +
+    `*Calendar hoy:*\n${calendarTexto}\n\n` +
+    `*Token Gmail/Calendar/Tasks:* ${googleOAuthExpired ? '⚠️ vencido, pendiente de reautorización.' : 'OK.'}\n\n` +
+    `*Modelos (catálogo A3):* ${modelosTexto}`
+  );
+}
+
 // Cloud Run escala a cero y no puede sostener un loop de polling (bot.launch()) — el bot
 // recibe los updates vía webhook: Telegram le pega a WEBHOOK_URL/<path secreto> cuando hay un mensaje nuevo.
 const WEBHOOK_PATH = `/telegraf/${process.env.TELEGRAM_BOT_TOKEN}`;
@@ -1157,6 +2208,10 @@ const PORT = process.env.PORT || 8080;
 async function startBot() {
   console.log('🚀 Iniciando OpenGravity Bot (modo webhook)...');
   await testOpenRouter();
+  const modelPings = await pingAllCatalogModels();
+  const failing = modelPings.filter((m) => !m.ok);
+  if (failing.length) console.error('⚠️ Modelos del catálogo A3 fallando al arranque:', failing.map((m) => `${m.model}: ${m.detail}`).join(' | '));
+  else console.log('✅ Todos los modelos del catálogo A3 responden OK.');
 
   const webhookUrl = process.env.WEBHOOK_URL;
   if (!webhookUrl) {
@@ -1176,6 +2231,25 @@ async function startBot() {
     if (req.url === '/' || req.url === '/health') {
       res.writeHead(200, { 'Content-Type': 'text/plain' });
       return res.end('OK');
+    }
+    // Endpoint del aviso diario (ítem 3.7): lo dispara Cloud Scheduler a la hora de
+    // configuracion_bot.hora_aviso_diario. Protegido por un secreto de header, no por la
+    // allowlist de Telegram (esto no llega por Telegram).
+    if (req.method === 'POST' && req.url === '/cron/daily-brief') {
+      if (req.headers['x-cron-secret'] !== process.env.CRON_SECRET_TOKEN) {
+        res.writeHead(403); return res.end('forbidden');
+      }
+      res.writeHead(200, { 'Content-Type': 'application/json' });
+      res.end('{"ok":true}');
+      (async () => {
+        try {
+          const brief = await buildDailyBrief(process.env.TELEGRAM_ALLOWED_USER_ID);
+          await bot.telegram.sendMessage(process.env.TELEGRAM_ALLOWED_USER_ID, brief, { parse_mode: 'Markdown' });
+        } catch (err) {
+          console.error('Error generando/enviando el aviso diario:', err.message);
+        }
+      })();
+      return;
     }
     if (req.method === 'POST' && req.url === WEBHOOK_PATH) {
       let body = '';
@@ -1207,5 +2281,7 @@ async function startBot() {
 
 startBot();
 
-process.once('SIGINT', () => bot.stop('SIGINT'));
-process.once('SIGTERM', () => bot.stop('SIGTERM'));
+// No hace falta bot.stop() acá: la app corre Telegraf en modo webhook manual (server.listen +
+// setWebhook), nunca bot.launch() — Telegraf.stop() asume que se lanzó con .launch() y tira
+// "Error: Bot is not running!" si no, ensuciando los logs en cada SIGTERM real (Cloud Run reciclando
+// una instancia). Cloud Run mata el proceso igual apenas termina el handler, no queda nada que cerrar.
