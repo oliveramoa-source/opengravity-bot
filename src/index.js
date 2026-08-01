@@ -393,7 +393,28 @@ async function tasksListLists(userId) {
   return callGoogleAPI(userId, () => tasksClient.tasklists.list({ maxResults: 100 }));
 }
 
+// Freno anti-duplicados a nivel código (mismo patrón que tasksCreate) — bug real visto en vivo
+// (01/08/2026): al reformular un pedido tras quedarse sin rondas, el modelo volvió a llamar esta
+// herramienta en vez de reusar la lista ya creada, generando dos listas con el mismo título que
+// hubo que desambiguar y borrar a mano. Se chequea el título contra las listas existentes antes de
+// insertar — si ya existe, se devuelve la existente en vez de crear una nueva.
 async function tasksCreateList(userId, title) {
+  const existingResult = await tasksListLists(userId);
+  if (existingResult.ok) {
+    const normalizedTitle = (title || '').trim().toLowerCase();
+    const dup = (existingResult.data.data.items || []).find((l) =>
+      (l.title || '').trim().toLowerCase() === normalizedTitle
+    );
+    if (dup) {
+      await logAccion({
+        accion: 'tasks_crear_lista',
+        destinatario_o_archivo: title,
+        confirmada: false,
+        resultado: `omitida, ya existía id ${dup.id}`,
+      });
+      return { ok: true, alreadyExisted: true, data: { data: dup } };
+    }
+  }
   const result = await callGoogleAPI(userId, () => tasksClient.tasklists.insert({ requestBody: { title } }));
   await logAccion({
     accion: 'tasks_crear_lista',
@@ -1386,6 +1407,7 @@ const TOOL_HANDLERS = {
     const result = await tasksCreateList(ctx.from.id, title);
     if (result.expired) return 'Token vencido, pendiente de reautorización.';
     if (!result.ok) return `Error creando la lista: ${result.error}`;
+    if (result.alreadyExisted) return `Ya existía una lista con el título "${title}" (id ${result.data.data.id}) — no se creó de nuevo, se usa la existente.`;
     return `Lista creada: "${title}", id ${result.data.data.id}.`;
   },
 
