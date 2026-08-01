@@ -377,7 +377,9 @@ async function calendarSearchEvents(userId, { query, timeMin, timeMax }) {
 }
 
 // ─────────────────────────────────────────
-// GOOGLE TASKS — crear/editar/marcar, sin gate (no toca terceros)
+// GOOGLE TASKS — listas, crear/marcar/descompletar sin gate (checklist personal, error barato de
+// corregir); tasklists.delete y tasks.delete SÍ gatean (destructivo y sin papelera — ver comentario
+// de tasksDeleteList/tasksDelete más abajo). Scope 'tasks' (no 'tasks.readonly') ya autorizado.
 // ─────────────────────────────────────────
 async function tasksGetDefaultListId(userId) {
   const result = await callGoogleAPI(userId, () => tasksClient.tasklists.list({ maxResults: 1 }));
@@ -385,11 +387,90 @@ async function tasksGetDefaultListId(userId) {
   return result.data.data.items?.[0]?.id || null;
 }
 
-async function tasksCreate(userId, { title, notes, due }) {
-  const listId = await tasksGetDefaultListId(userId);
+// Lista TODAS las tasklists (antes solo se pedía la primera con maxResults:1) — necesario para que
+// crear_tarea pueda elegir destino y para poder identificar qué lista borrar.
+async function tasksListLists(userId) {
+  return callGoogleAPI(userId, () => tasksClient.tasklists.list({ maxResults: 100 }));
+}
+
+async function tasksCreateList(userId, title) {
+  const result = await callGoogleAPI(userId, () => tasksClient.tasklists.insert({ requestBody: { title } }));
+  await logAccion({
+    accion: 'tasks_crear_lista',
+    destinatario_o_archivo: title,
+    confirmada: false,
+    resultado: result.ok ? `creada, id ${result.data.data.id}` : (result.expired ? 'token vencido' : `error: ${result.error}`),
+  });
+  return result;
+}
+
+// Renombra una lista (tasklists.patch) — sin gate, es un cambio de nombre, no borra nada. Bug real
+// visto en vivo (31/07/2026): no existía ESTA herramienta y el modelo, sin ninguna forma real de
+// cumplir el pedido, inventó en texto que ya lo había hecho — se cierra dándole la herramienta real.
+async function tasksRenameList(userId, tasklistId, title) {
+  const result = await callGoogleAPI(userId, () => tasksClient.tasklists.patch({ tasklist: tasklistId, requestBody: { title } }));
+  await logAccion({
+    accion: 'tasks_renombrar_lista',
+    destinatario_o_archivo: `${tasklistId} -> ${title}`,
+    confirmada: false,
+    resultado: result.ok ? 'renombrada' : (result.expired ? 'token vencido' : `error: ${result.error}`),
+  });
+  return result;
+}
+
+// tasklists.delete borra la lista Y todas sus tareas, sin papelera de recuperación — a diferencia
+// de Calendar (papelera web) o Gmail (Papelera), acá Google no da ninguna red de seguridad nativa.
+// Por eso gatea siempre, sin excepción (ver ACTION_LABELS/tasks_delete_list).
+async function tasksDeleteList(userId, tasklistId) {
+  const result = await callGoogleAPI(userId, () => tasksClient.tasklists.delete({ tasklist: tasklistId }));
+  await logAccion({
+    accion: 'tasks_borrar_lista',
+    destinatario_o_archivo: tasklistId,
+    confirmada: true,
+    resultado: result.ok ? 'lista borrada' : (result.expired ? 'token vencido' : `error: ${result.error}`),
+  });
+  return result;
+}
+
+// parentTaskId (query param de la API, no va en el body) crea la tarea directo como subtarea de
+// otra — un solo nivel de anidamiento, que es todo lo que la API de Tasks soporta.
+//
+// Freno anti-duplicados a nivel código (no de prompt — ver Lección Gordon): bug real visto en vivo
+// (31/07/2026) donde un pedido de "revisá y completá lo que faltó" hizo que el modelo, confiando
+// en su propia memoria de la conversación en vez del estado real de Tasks, volviera a crear ítems
+// que ya existían. En vez de depender de que el modelo razone bien (no es confiable, ya se vio
+// varias veces esta sesión), acá se chequea el título contra lo que YA existe en esa lista (mismo
+// padre si es subtarea) antes de insertar — si ya existe, no se duplica, se devuelve el existente.
+// Esto vuelve seguro que el modelo simplemente reintente crear todo el lote pedido sin pensar en
+// qué falta: lo que ya está, se saltea solo.
+async function tasksCreate(userId, { title, notes, due, tasklistId, parentTaskId }) {
+  const listId = tasklistId || await tasksGetDefaultListId(userId);
   if (!listId) return { ok: false, expired: googleOAuthExpired };
+  const existingResult = await callGoogleAPI(userId, () =>
+    tasksClient.tasks.list({ tasklist: listId, showCompleted: true, showHidden: true, maxResults: 100 })
+  );
+  if (existingResult.ok) {
+    const normalizedTitle = (title || '').trim().toLowerCase();
+    const dup = (existingResult.data.data.items || []).find((t) =>
+      (t.title || '').trim().toLowerCase() === normalizedTitle &&
+      (t.parent || null) === (parentTaskId || null)
+    );
+    if (dup) {
+      await logAccion({
+        accion: 'tasks_crear',
+        destinatario_o_archivo: title,
+        confirmada: false,
+        resultado: `omitida, ya existía id ${dup.id}`,
+      });
+      return { ok: true, alreadyExisted: true, data: { data: dup } };
+    }
+  }
   const result = await callGoogleAPI(userId, () =>
-    tasksClient.tasks.insert({ tasklist: listId, requestBody: { title, notes, due } })
+    tasksClient.tasks.insert({
+      tasklist: listId,
+      ...(parentTaskId ? { parent: parentTaskId } : {}),
+      requestBody: { title, notes, due },
+    })
   );
   await logAccion({
     accion: 'tasks_crear',
@@ -400,8 +481,47 @@ async function tasksCreate(userId, { title, notes, due }) {
   return result;
 }
 
-async function tasksComplete(userId, taskId) {
-  const listId = await tasksGetDefaultListId(userId);
+// Edita título/notas/fecha de una tarea existente (patch, no reemplaza campos no enviados) — no
+// existía ninguna forma de corregir esos campos salvo borrar y crear de nuevo. Sin gate: es una
+// checklist personal, corregir es gratis (mismo criterio que el resto de Tasks).
+async function tasksUpdate(userId, taskId, { title, notes, due, tasklistId }) {
+  const listId = tasklistId || await tasksGetDefaultListId(userId);
+  if (!listId) return { ok: false, expired: googleOAuthExpired };
+  const requestBody = {};
+  if (title !== undefined) requestBody.title = title;
+  if (notes !== undefined) requestBody.notes = notes;
+  if (due !== undefined) requestBody.due = due;
+  const result = await callGoogleAPI(userId, () =>
+    tasksClient.tasks.patch({ tasklist: listId, task: taskId, requestBody })
+  );
+  await logAccion({
+    accion: 'tasks_editar',
+    destinatario_o_archivo: taskId,
+    confirmada: false,
+    resultado: result.ok ? 'editada' : (result.expired ? 'token vencido' : `error: ${result.error}`),
+  });
+  return result;
+}
+
+// tasks.move reasigna el padre de una tarea (parentTaskId ausente/null la sube a tarea principal) —
+// así se arma o se deshace una subtarea. Sin gate: reversible, no borra nada.
+async function tasksMove(userId, taskId, { tasklistId, parentTaskId }) {
+  const listId = tasklistId || await tasksGetDefaultListId(userId);
+  if (!listId) return { ok: false, expired: googleOAuthExpired };
+  const result = await callGoogleAPI(userId, () =>
+    tasksClient.tasks.move({ tasklist: listId, task: taskId, ...(parentTaskId ? { parent: parentTaskId } : {}) })
+  );
+  await logAccion({
+    accion: 'tasks_mover',
+    destinatario_o_archivo: taskId,
+    confirmada: false,
+    resultado: result.ok ? (parentTaskId ? `subtarea de ${parentTaskId}` : 'promovida a tarea principal') : (result.expired ? 'token vencido' : `error: ${result.error}`),
+  });
+  return result;
+}
+
+async function tasksComplete(userId, taskId, tasklistId) {
+  const listId = tasklistId || await tasksGetDefaultListId(userId);
   if (!listId) return { ok: false, expired: googleOAuthExpired };
   const result = await callGoogleAPI(userId, () =>
     tasksClient.tasks.patch({ tasklist: listId, task: taskId, requestBody: { status: 'completed' } })
@@ -415,15 +535,46 @@ async function tasksComplete(userId, taskId) {
   return result;
 }
 
-// Lista tareas pendientes por texto para resolver el taskId sin pedírselo a Mariano (mismo
-// problema real detectado 28/07/2026 en Calendar, agravado acá: no existía NINGUNA forma de listar
-// tareas existentes — marcar_tarea_completa no tenía cómo conseguir el taskId más que preguntándole
-// a él a mano).
-async function tasksSearch(userId, { query }) {
-  const listId = await tasksGetDefaultListId(userId);
+// Descompletar: toggle inverso de tasksComplete — reversible, mismo criterio (sin gate).
+async function tasksUncomplete(userId, taskId, tasklistId) {
+  const listId = tasklistId || await tasksGetDefaultListId(userId);
   if (!listId) return { ok: false, expired: googleOAuthExpired };
   const result = await callGoogleAPI(userId, () =>
-    tasksClient.tasks.list({ tasklist: listId, showCompleted: false, maxResults: 50 })
+    tasksClient.tasks.patch({ tasklist: listId, task: taskId, requestBody: { status: 'needsAction' } })
+  );
+  await logAccion({
+    accion: 'tasks_descompletar',
+    destinatario_o_archivo: taskId,
+    confirmada: false,
+    resultado: result.ok ? 'descompletada' : (result.expired ? 'token vencido' : `error: ${result.error}`),
+  });
+  return result;
+}
+
+// tasks.delete borra el ítem para siempre, sin papelera — mismo criterio que tasksDeleteList: gatea siempre.
+async function tasksDelete(userId, taskId, tasklistId) {
+  const listId = tasklistId || await tasksGetDefaultListId(userId);
+  if (!listId) return { ok: false, expired: googleOAuthExpired };
+  const result = await callGoogleAPI(userId, () => tasksClient.tasks.delete({ tasklist: listId, task: taskId }));
+  await logAccion({
+    accion: 'tasks_borrar',
+    destinatario_o_archivo: taskId,
+    confirmada: true,
+    resultado: result.ok ? 'borrada' : (result.expired ? 'token vencido' : `error: ${result.error}`),
+  });
+  return result;
+}
+
+// Lista tareas por texto para resolver el taskId sin pedírselo a Mariano (mismo problema real
+// detectado 28/07/2026 en Calendar, agravado acá: no existía NINGUNA forma de listar tareas
+// existentes). Acepta tasklistId opcional (default: la lista por defecto, igual que antes) para
+// buscar en una lista puntual, y showCompleted opcional porque por default la API oculta
+// completadas — necesario para poder encontrar una tarea ya completada y descompletarla.
+async function tasksSearch(userId, { query, tasklistId, showCompleted }) {
+  const listId = tasklistId || await tasksGetDefaultListId(userId);
+  if (!listId) return { ok: false, expired: googleOAuthExpired };
+  const result = await callGoogleAPI(userId, () =>
+    tasksClient.tasks.list({ tasklist: listId, showCompleted: !!showCompleted, showHidden: !!showCompleted, maxResults: 50 })
   );
   if (!result.ok) return result;
   let items = result.data.data.items || [];
@@ -431,7 +582,7 @@ async function tasksSearch(userId, { query }) {
     const q = query.toLowerCase();
     items = items.filter((t) => (t.title || '').toLowerCase().includes(q));
   }
-  return { ok: true, data: { data: { items } } };
+  return { ok: true, data: { data: { items, tasklistId: listId } } };
 }
 
 // ─────────────────────────────────────────
@@ -459,6 +610,8 @@ const ACTION_LABELS = {
   calendar_event: { display: 'creAr', letter: 'A', synonyms: ['crear', 'creá', 'crea'] },
   calendar_update: { display: 'eDitar', letter: 'D', synonyms: ['editar', 'cambiar', 'cambiá', 'cambia', 'modificar'] },
   calendar_delete: { display: 'Borrar', letter: 'B', synonyms: ['borrar', 'eliminar'] },
+  tasks_delete_item: { display: 'Borrar', letter: 'B', synonyms: ['borrar', 'eliminar'] },
+  tasks_delete_list: { display: 'Borrar', letter: 'B', synonyms: ['borrar', 'eliminar'] },
 };
 const DEFAULT_ACTION_LABEL = { display: 'Confirmar', letter: 'F', synonyms: [] };
 
@@ -542,6 +695,8 @@ async function runPendingAction({ kind, payload, userId }) {
   else if (kind === 'calendar_event') result = await calendarCreateEvent(userId, payload);
   else if (kind === 'calendar_update') result = await calendarUpdateEvent(userId, payload);
   else if (kind === 'calendar_delete') result = await calendarDeleteEvent(userId, payload.eventId, payload.hasAttendees);
+  else if (kind === 'tasks_delete_item') result = await tasksDelete(userId, payload.taskId, payload.tasklistId);
+  else if (kind === 'tasks_delete_list') result = await tasksDeleteList(userId, payload.tasklistId);
   else return { ok: false, error: 'Tipo de confirmación no reconocido.' };
   return result;
 }
@@ -879,14 +1034,66 @@ const TOOL_DEFS = [
   {
     type: 'function',
     function: {
+      name: 'listar_listas_tareas',
+      description: 'Lista todas las listas (tasklists) de Google Tasks existentes (id, título) — usalo cuando Mariano mencione una lista por nombre (para conseguir su tasklistId), cuando quiera ver qué listas tiene, o antes de crear_tarea/borrar_lista_tareas si no tenés ya el tasklistId. Si Mariano no menciona ninguna lista puntual, no hace falta llamar esto: crear_tarea sin tasklistId usa la lista por defecto.',
+      parameters: { type: 'object', properties: {} },
+    },
+  },
+  {
+    type: 'function',
+    function: {
+      name: 'crear_lista_tareas',
+      description: 'Crea una lista (tasklist) nueva en Google Tasks — sin confirmación, crear una lista vacía no tiene riesgo.',
+      parameters: {
+        type: 'object',
+        properties: { title: { type: 'string', description: 'Nombre de la lista nueva.' } },
+        required: ['title'],
+      },
+    },
+  },
+  {
+    type: 'function',
+    function: {
+      name: 'editar_lista_tareas',
+      description: 'Renombra una lista (tasklist) existente de Google Tasks — sin confirmación, cambiar un nombre no tiene riesgo. Necesita el tasklistId: si no lo tenés, llamá primero a listar_listas_tareas y confirmá con Mariano cuál es antes de renombrarla — NUNCA le pidas el ID a él.',
+      parameters: {
+        type: 'object',
+        properties: {
+          tasklistId: { type: 'string', description: 'ID exacto de la lista a renombrar (obtenido de listar_listas_tareas).' },
+          title: { type: 'string', description: 'Nuevo nombre de la lista.' },
+        },
+        required: ['tasklistId', 'title'],
+      },
+    },
+  },
+  {
+    type: 'function',
+    function: {
+      name: 'borrar_lista_tareas',
+      description: 'Borra una lista (tasklist) completa de Google Tasks, junto con TODAS sus tareas — SIEMPRE con confirmación previa por botones, porque a diferencia de Calendar/Gmail no hay papelera de recuperación. Necesita el tasklistId: si no lo tenés, llamá primero a listar_listas_tareas y confirmá con Mariano cuál es antes de borrarla — NUNCA le pidas el ID a él.',
+      parameters: {
+        type: 'object',
+        properties: {
+          tasklistId: { type: 'string', description: 'ID exacto de la lista a borrar (obtenido de listar_listas_tareas).' },
+          nombreLista: { type: 'string', description: 'Nombre de la lista, para mostrarlo en la confirmación.' },
+        },
+        required: ['tasklistId', 'nombreLista'],
+      },
+    },
+  },
+  {
+    type: 'function',
+    function: {
       name: 'crear_tarea',
-      description: 'Crea un ítem en Google Tasks — sin confirmación, es una checklist personal. El campo due solo guarda fecha, nunca hora: si la instrucción menciona una hora específica, además llamá a crear_evento_calendar para esa hora.',
+      description: 'Crea un ítem en Google Tasks — sin confirmación, es una checklist personal. El campo due solo guarda fecha, nunca hora: si la instrucción menciona una hora específica, además llamá a crear_evento_calendar para esa hora (Tasks no tiene concepto de recordatorio propio, es limitación real de la API de Google). Si Mariano menciona una lista puntual por nombre, usá tasklistId (conseguilo con listar_listas_tareas primero); si no menciona ninguna, omitilo y va a la lista por defecto. Si el pedido es una SUBtarea de otra tarea ya existente ("agregale un paso a X", "como parte de Y"), usá parentTaskId con el id de la tarea padre (conseguilo con buscar_tareas si no lo tenés). Si Mariano pide "revisá/completá lo que faltó" de un lote que le pediste antes, es SEGURO volver a llamar esta herramienta para TODOS los ítems del lote original tal como los tengas en el historial, uno por uno — la herramienta detecta sola si un título ya existe en esa lista (mismo padre) y no lo duplica, así que no hace falta adivinar cuáles faltan.',
       parameters: {
         type: 'object',
         properties: {
           title: { type: 'string', description: 'Título de la tarea.' },
           notes: { type: 'string', description: 'Notas opcionales.' },
           due: { type: 'string', description: 'Fecha límite en formato ISO 8601 (solo fecha, ej. 2026-07-30T00:00:00.000Z), opcional.' },
+          tasklistId: { type: 'string', description: 'ID de la lista destino, opcional (default: la lista por defecto de Mariano). Conseguilo con listar_listas_tareas si Mariano nombró una lista puntual.' },
+          parentTaskId: { type: 'string', description: 'ID de la tarea padre, opcional — si se da, esta tarea se crea como subtarea de esa. Un solo nivel de anidamiento (límite de la API).' },
         },
         required: ['title'],
       },
@@ -895,12 +1102,48 @@ const TOOL_DEFS = [
   {
     type: 'function',
     function: {
-      name: 'buscar_tareas',
-      description: 'Lista las tareas pendientes de Google Tasks (id, título), opcionalmente filtradas por texto del título. SIEMPRE llamá esta herramienta antes de marcar_tarea_completa cuando no tengas ya el taskId de la conversación — NUNCA le pidas el ID a Mariano, él te dice el título/tema de la tarea y vos la buscás acá. Si hay una sola coincidencia, confirmá con él que es esa antes de marcarla. Si hay varias, mostrale la lista para que elija.',
+      name: 'editar_tarea',
+      description: 'Edita título, notas y/o fecha límite de una tarea de Tasks existente — sin confirmación, es una checklist personal. NUNCA uses esto para marcarla completa/pendiente (eso es marcar_tarea_completa/descompletar_tarea) ni para cambiarla de lista o hacerla subtarea (eso es mover_tarea). Necesita el taskId: si no lo tenés, llamá primero a buscar_tareas y confirmá con Mariano cuál es — NUNCA le pidas el ID a él.',
       parameters: {
         type: 'object',
         properties: {
-          query: { type: 'string', description: 'Texto a buscar en el título de la tarea. Vacío para listar todas las pendientes.' },
+          taskId: { type: 'string', description: 'ID exacto de la tarea a editar (obtenido de buscar_tareas).' },
+          tasklistId: { type: 'string', description: 'ID de la lista donde está la tarea, opcional (default: la lista por defecto). Si buscar_tareas devolvió un tasklistId, pasalo acá.' },
+          title: { type: 'string', description: 'Nuevo título, opcional (omitir si no cambia).' },
+          notes: { type: 'string', description: 'Nuevas notas, opcional (omitir si no cambia).' },
+          due: { type: 'string', description: 'Nueva fecha límite ISO 8601 (solo fecha), opcional (omitir si no cambia).' },
+        },
+        required: ['taskId'],
+      },
+    },
+  },
+  {
+    type: 'function',
+    function: {
+      name: 'mover_tarea',
+      description: 'Convierte una tarea en subtarea de otra, o la vuelve a subir a tarea principal (sacándola de su padre actual) — sin confirmación, reversible. Necesita el taskId: si no lo tenés, llamá primero a buscar_tareas — NUNCA le pidas el ID a Mariano.',
+      parameters: {
+        type: 'object',
+        properties: {
+          taskId: { type: 'string', description: 'ID exacto de la tarea a mover (obtenido de buscar_tareas).' },
+          tasklistId: { type: 'string', description: 'ID de la lista donde está la tarea, opcional (default: la lista por defecto).' },
+          parentTaskId: { type: 'string', description: 'ID de la nueva tarea padre. Omitilo (no lo mandes) si el pedido es sacarla de su padre y volverla tarea principal.' },
+        },
+        required: ['taskId'],
+      },
+    },
+  },
+  {
+    type: 'function',
+    function: {
+      name: 'buscar_tareas',
+      description: 'Lista las tareas de Google Tasks (id, título), opcionalmente filtradas por texto del título. SIEMPRE llamá esta herramienta antes de marcar_tarea_completa, descompletar_tarea o borrar_tarea cuando no tengas ya el taskId de la conversación — NUNCA le pidas el ID a Mariano, él te dice el título/tema de la tarea y vos la buscás acá. Si hay una sola coincidencia, confirmá con él que es esa antes de actuar. Si hay varias, mostrale la lista para que elija. Por default solo trae tareas pendientes: para encontrar una tarea YA completada (ej. para descompletarla), llamá de nuevo con incluirCompletadas:true.',
+      parameters: {
+        type: 'object',
+        properties: {
+          query: { type: 'string', description: 'Texto a buscar en el título de la tarea. Vacío para listar todas.' },
+          tasklistId: { type: 'string', description: 'ID de la lista a buscar, opcional (default: la lista por defecto).' },
+          incluirCompletadas: { type: 'boolean', description: 'true para incluir tareas ya completadas en el resultado (por default se ocultan).' },
         },
       },
     },
@@ -912,8 +1155,42 @@ const TOOL_DEFS = [
       description: 'Marca un ítem de Google Tasks como completado — sin confirmación. Necesita el taskId: si no lo tenés, llamá primero a buscar_tareas y confirmá con Mariano cuál es antes de marcarla — NUNCA le pidas el ID a él.',
       parameters: {
         type: 'object',
-        properties: { taskId: { type: 'string', description: 'ID exacto de la tarea a marcar completa (obtenido de buscar_tareas o de una respuesta anterior).' } },
+        properties: {
+          taskId: { type: 'string', description: 'ID exacto de la tarea a marcar completa (obtenido de buscar_tareas o de una respuesta anterior).' },
+          tasklistId: { type: 'string', description: 'ID de la lista donde está la tarea, opcional (default: la lista por defecto). Si buscar_tareas devolvió un tasklistId, pasalo acá.' },
+        },
         required: ['taskId'],
+      },
+    },
+  },
+  {
+    type: 'function',
+    function: {
+      name: 'descompletar_tarea',
+      description: 'Vuelve a marcar como pendiente una tarea de Google Tasks ya completada (toggle inverso a marcar_tarea_completa) — sin confirmación, es reversible. Necesita el taskId: si no lo tenés, llamá primero a buscar_tareas con incluirCompletadas:true (las completadas no aparecen por default) y confirmá con Mariano cuál es — NUNCA le pidas el ID a él.',
+      parameters: {
+        type: 'object',
+        properties: {
+          taskId: { type: 'string', description: 'ID exacto de la tarea a descompletar (obtenido de buscar_tareas con incluirCompletadas:true).' },
+          tasklistId: { type: 'string', description: 'ID de la lista donde está la tarea, opcional (default: la lista por defecto). Si buscar_tareas devolvió un tasklistId, pasalo acá.' },
+        },
+        required: ['taskId'],
+      },
+    },
+  },
+  {
+    type: 'function',
+    function: {
+      name: 'borrar_tarea',
+      description: 'Borra un ítem de Google Tasks para siempre — SIEMPRE con confirmación previa por botones, porque a diferencia de Calendar no hay papelera de recuperación. Necesita el taskId: si no lo tenés, llamá primero a buscar_tareas y confirmá con Mariano cuál es antes de borrarla — NUNCA le pidas el ID a él.',
+      parameters: {
+        type: 'object',
+        properties: {
+          taskId: { type: 'string', description: 'ID exacto de la tarea a borrar (obtenido de buscar_tareas).' },
+          tasklistId: { type: 'string', description: 'ID de la lista donde está la tarea, opcional (default: la lista por defecto). Si buscar_tareas devolvió un tasklistId, pasalo acá.' },
+          tituloTarea: { type: 'string', description: 'Título de la tarea, para mostrarlo en la confirmación.' },
+        },
+        required: ['taskId', 'tituloTarea'],
       },
     },
   },
@@ -1094,30 +1371,102 @@ const TOOL_HANDLERS = {
     return 'Le mostré la confirmación a Mariano — no se borró todavía.';
   },
 
-  crear_tarea: async ({ title, notes, due }, ctx) => {
+  listar_listas_tareas: async (_args, ctx) => {
     if (googleOAuthExpired) return 'El token de Tasks está vencido, pendiente de reautorización.';
-    const result = await tasksCreate(ctx.from.id, { title, notes, due });
+    const result = await tasksListLists(ctx.from.id);
     if (result.expired) return 'Token vencido, pendiente de reautorización.';
-    if (!result.ok) return `Error creando la tarea: ${result.error}`;
-    return `Tarea creada: "${title}"${due ? ` (vence ${due.slice(0, 10)})` : ''}. Recordá: due no guarda hora, si hace falta hora exacta hay que crear también un evento de Calendar.`;
+    if (!result.ok) return `Error listando las listas: ${result.error}`;
+    const items = result.data.data.items || [];
+    if (!items.length) return 'No encontré ninguna lista de Tasks.';
+    return items.map((l) => `id: ${l.id}\nTítulo: ${l.title}`).join('\n\n');
   },
 
-  buscar_tareas: async ({ query }, ctx) => {
+  crear_lista_tareas: async ({ title }, ctx) => {
     if (googleOAuthExpired) return 'El token de Tasks está vencido, pendiente de reautorización.';
-    const result = await tasksSearch(ctx.from.id, { query });
+    const result = await tasksCreateList(ctx.from.id, title);
+    if (result.expired) return 'Token vencido, pendiente de reautorización.';
+    if (!result.ok) return `Error creando la lista: ${result.error}`;
+    return `Lista creada: "${title}", id ${result.data.data.id}.`;
+  },
+
+  editar_lista_tareas: async ({ tasklistId, title }, ctx) => {
+    if (googleOAuthExpired) return 'El token de Tasks está vencido, pendiente de reautorización.';
+    const result = await tasksRenameList(ctx.from.id, tasklistId, title);
+    if (result.expired) return 'Token vencido, pendiente de reautorización.';
+    if (!result.ok) return `Error renombrando la lista: ${result.error}`;
+    return `Lista renombrada a "${title}".`;
+  },
+
+  borrar_lista_tareas: async ({ tasklistId, nombreLista }, ctx) => {
+    if (googleOAuthExpired) return 'El token de Tasks está vencido, pendiente de reautorización.';
+    await askConfirmation(ctx, {
+      kind: 'tasks_delete_list',
+      payload: { tasklistId },
+      preview: `🗑️ *¿Borro la lista "${nombreLista}" y TODAS sus tareas?*\n\nID: ${tasklistId}\n⚠️ No hay papelera, es definitivo.`,
+    });
+    return 'Le mostré la confirmación a Mariano — no se borró todavía.';
+  },
+
+  crear_tarea: async ({ title, notes, due, tasklistId, parentTaskId }, ctx) => {
+    if (googleOAuthExpired) return 'El token de Tasks está vencido, pendiente de reautorización.';
+    const result = await tasksCreate(ctx.from.id, { title, notes, due, tasklistId, parentTaskId });
+    if (result.expired) return 'Token vencido, pendiente de reautorización.';
+    if (!result.ok) return `Error creando la tarea: ${result.error}`;
+    if (result.alreadyExisted) return `Ya existía una tarea con el título "${title}" en esa lista (id ${result.data.data.id}) — no se creó de nuevo, se saltea sola.`;
+    return `Tarea creada: "${title}"${due ? ` (vence ${due.slice(0, 10)})` : ''}${parentTaskId ? ` como subtarea de ${parentTaskId}` : ''}. Recordá: due no guarda hora, si hace falta hora exacta hay que crear también un evento de Calendar.`;
+  },
+
+  editar_tarea: async ({ taskId, tasklistId, title, notes, due }, ctx) => {
+    if (googleOAuthExpired) return 'El token de Tasks está vencido, pendiente de reautorización.';
+    const result = await tasksUpdate(ctx.from.id, taskId, { title, notes, due, tasklistId });
+    if (result.expired) return 'Token vencido, pendiente de reautorización.';
+    if (!result.ok) return `Error editando la tarea: ${result.error}`;
+    return 'Tarea editada.';
+  },
+
+  mover_tarea: async ({ taskId, tasklistId, parentTaskId }, ctx) => {
+    if (googleOAuthExpired) return 'El token de Tasks está vencido, pendiente de reautorización.';
+    const result = await tasksMove(ctx.from.id, taskId, { tasklistId, parentTaskId });
+    if (result.expired) return 'Token vencido, pendiente de reautorización.';
+    if (!result.ok) return `Error moviendo la tarea: ${result.error}`;
+    return parentTaskId ? `Tarea convertida en subtarea de ${parentTaskId}.` : 'Tarea promovida a tarea principal.';
+  },
+
+  buscar_tareas: async ({ query, tasklistId, incluirCompletadas }, ctx) => {
+    if (googleOAuthExpired) return 'El token de Tasks está vencido, pendiente de reautorización.';
+    const result = await tasksSearch(ctx.from.id, { query, tasklistId, showCompleted: !!incluirCompletadas });
     if (result.expired) return 'Token vencido, pendiente de reautorización.';
     if (!result.ok) return `Error buscando tareas: ${result.error}`;
     const items = result.data.data.items || [];
-    if (!items.length) return 'No encontré tareas pendientes que coincidan con esa búsqueda.';
-    return items.map((t) => `id: ${t.id}\nTítulo: ${t.title}`).join('\n\n');
+    if (!items.length) return 'No encontré tareas que coincidan con esa búsqueda.';
+    const listId = result.data.data.tasklistId;
+    return items.map((t) => `id: ${t.id}\ntasklistId: ${listId}\nTítulo: ${t.title}${t.status === 'completed' ? ' (completada)' : ''}${t.parent ? `\nSubtarea de: ${t.parent}` : ''}`).join('\n\n');
   },
 
-  marcar_tarea_completa: async ({ taskId }, ctx) => {
+  marcar_tarea_completa: async ({ taskId, tasklistId }, ctx) => {
     if (googleOAuthExpired) return 'El token de Tasks está vencido, pendiente de reautorización.';
-    const result = await tasksComplete(ctx.from.id, taskId);
+    const result = await tasksComplete(ctx.from.id, taskId, tasklistId);
     if (result.expired) return 'Token vencido, pendiente de reautorización.';
     if (!result.ok) return `Error marcando la tarea: ${result.error}`;
     return 'Tarea marcada como completa.';
+  },
+
+  descompletar_tarea: async ({ taskId, tasklistId }, ctx) => {
+    if (googleOAuthExpired) return 'El token de Tasks está vencido, pendiente de reautorización.';
+    const result = await tasksUncomplete(ctx.from.id, taskId, tasklistId);
+    if (result.expired) return 'Token vencido, pendiente de reautorización.';
+    if (!result.ok) return `Error descompletando la tarea: ${result.error}`;
+    return 'Tarea vuelta a marcar como pendiente.';
+  },
+
+  borrar_tarea: async ({ taskId, tasklistId, tituloTarea }, ctx) => {
+    if (googleOAuthExpired) return 'El token de Tasks está vencido, pendiente de reautorización.';
+    await askConfirmation(ctx, {
+      kind: 'tasks_delete_item',
+      payload: { taskId, tasklistId },
+      preview: `🗑️ *¿Borro esta tarea?*\n\n"${tituloTarea}"\nID: ${taskId}\n⚠️ No hay papelera, es definitivo.`,
+    });
+    return 'Le mostré la confirmación a Mariano — no se borró todavía.';
   },
 
   // El carril "Project" (buzón Drive por carpeta) necesita el scope de Drive, que NO está entre
@@ -1210,6 +1559,51 @@ function looksLikeFakeCompletedGatedAction(text) {
   return completedPhrase.test(text) && actionNoun.test(text);
 }
 
+// Firma 3: acción de Tasks LIBRE (sin gate) declarada como YA HECHA sin que la herramienta
+// correspondiente se haya llamado de verdad en este intercambio. Bug real visto en vivo
+// (31/07/2026): pedido de crear 4 tareas en lote agotó las 3 rondas creando solo 3 — Mariano
+// reformuló el pedido, y en ese reintento el modelo, en vez de volver a llamar crear_tarea,
+// contestó "✅ Tareas creadas..." con título de lista e id reales (vistos en el historial de la
+// conversación) pero CERO tool_calls en esa ronda — invención completa, no una simple confusión de
+// texto. La Firma 2 no lo agarra porque deliberadamente excluye crear/editar/marcar (tienen camino
+// legítimo sin gate) — acá el criterio no es el texto solo, es cruzarlo con qué herramientas se
+// llamaron de verdad en TODO el intercambio (no solo la última ronda).
+const TASKS_FREE_ACTION_TOOLS = ['crear_tarea', 'crear_lista_tareas', 'editar_tarea', 'editar_lista_tareas', 'marcar_tarea_completa', 'descompletar_tarea', 'mover_tarea'];
+function looksLikeFakeCompletedTasksAction(text, calledTools) {
+  if (!text) return false;
+  // Permisivo a propósito: "Subtarea comer perro creada" tiene el título METIDO entre "subtarea" y
+  // "creada" (no son palabras adyacentes) — la versión anterior de este regex exigía adyacencia y
+  // no detectaba esta frase real. Ver Firma 4 para el chequeo fino por título exacto.
+  const completedPhrase = /\b(tarea|subtarea|lista)\b[^.!?\n]{0,60}\b(creada|creadas|editada|editadas|marcada|descompletada|movida|convertida|renombrada|renombradas)\b/i;
+  if (!completedPhrase.test(text)) return false;
+  return !TASKS_FREE_ACTION_TOOLS.some((t) => calledTools.has(t));
+}
+
+// Firma 4: incluso con AL MENOS una llamada real a crear_tarea/editar_tarea en el intercambio, el
+// texto final puede colar OTRO título como "creado" que nunca pasó por la herramienta — bug real
+// visto en vivo (31/07/2026): en un pedido de 2 subtareas, se llamó crear_tarea solo para
+// "ventiladores tres" (resultó "ya existía"), y el texto final declaró TAMBIÉN "comer perro
+// creada" sin ninguna llamada para ese título — la Firma 3 no lo agarra porque calledTools SÍ tiene
+// crear_tarea (por la otra llamada). Acá el chequeo es por título, no por si la herramienta se usó.
+function stripAccents(s) {
+  return s.normalize('NFD').replace(/[̀-ͯ]/g, '');
+}
+function looksLikeFakeCreatedTaskTitle(text, actionedTitles) {
+  if (!text) return false;
+  const claimRegex = /\b(?:sub)?tarea\s+"?([^".!?\n]{2,60}?)"?\s+(?:fue\s+)?(?:creada|creado|editada|editado)\b/gi;
+  let match;
+  while ((match = claimRegex.exec(text)) !== null) {
+    const claimed = stripAccents(match[1].trim().toLowerCase());
+    if (!claimed) continue;
+    const found = [...actionedTitles].some((t) => {
+      const real = stripAccents(t.trim().toLowerCase());
+      return real === claimed || real.includes(claimed) || claimed.includes(real);
+    });
+    if (!found) return true;
+  }
+  return false;
+}
+
 // Filtro defensivo contra el canal "analysis" (razonamiento oculto) de gpt-oss filtrándose al
 // content final — bug documentado upstream, no nuestro (ver handoff 30/07/2026). Visto una vez en
 // vivo: la respuesta arrancó con ". We can say that editing drafts is not within current
@@ -1247,52 +1641,85 @@ async function chatWithTools(url, apiKey, model, messages, onToolNotice, ctx) {
   // correcto de rondas con datos reales en vez de conjeturar.
   const providerLabel = url.includes('groq') ? 'groq' : 'openrouter';
   let lastToolNames = [];
+  // Acumula TODAS las herramientas llamadas de verdad en todo el intercambio (no solo la última
+  // ronda) — necesario para la Firma 3 de looksLikeFakeCompletedTasksAction más abajo.
+  const calledTools = new Set();
+  // Títulos de crear_tarea/editar_tarea realmente invocados en este intercambio — necesario para
+  // la Firma 4 (chequeo por título exacto, más fino que calledTools) de looksLikeFakeCreatedTaskTitle.
+  const actionedTitles = new Set();
+  // Se probó subir a 5 rondas (31/07/2026) para pedidos de lote, pero se revirtió el mismo día:
+  // ya había un motivo real para el límite de 3 (ver comentario de AI_TIMEOUT_MS más abajo) — más
+  // rondas reales contra Google significa más chance de pisar el timeout general de 40s, y eso
+  // causó duplicados de verdad (ver looksLikeFakeCompletedTasksAction y el fix de callAIWithTimeout
+  // para el resultado tardío). Se queda en 3; los pedidos de lote grandes quedan mejor resueltos
+  // pidiéndole a Mariano que los parta en mensajes más chicos que agrandando este número.
+  const MAX_ROUNDS = 3;
 
-  for (let round = 0; round < 3; round++) {
+  for (let round = 0; round < MAX_ROUNDS; round++) {
     const response = await axios.post(
       url,
       {
         model, messages: convo, temperature: 0.5, tools: TOOL_DEFS, tool_choice: 'auto',
-        // gpt-oss (120b/20b) es un modelo de razonamiento: pide un canal "analysis" oculto antes
-        // del canal "final". Bug documentado upstream (Groq/vLLM/OpenRouter, no nuestro): a veces
-        // ese canal oculto se filtra al content visible (visto en vivo 29/07/2026, fragmento en
-        // inglés antes del texto en español real). Pedir reasoning:false reduce la frecuencia al
-        // no generar ese canal para empezar — no lo garantiza al 100%, por eso además queda el
-        // filtro defensivo de stripLeakedReasoningPreamble() más abajo.
-        ...(providerLabel === 'openrouter' ? { reasoning: { enabled: false } } : {}),
+        // NO mandar reasoning:{enabled:false} acá — probado en vivo (31/07/2026) y rompe el
+        // endpoint de gpt-oss en OpenRouter por completo ("Reasoning is mandatory for this
+        // endpoint and cannot be disabled"), tira abajo el modelo principal Y el fallback -20b,
+        // y cae en cascada hasta Nemotron nano (free) — que no llama herramientas de forma
+        // confiable e inventa en texto acciones que nunca ejecutó. La mitigación real del leak de
+        // razonamiento (ver handoff 30/07/2026) queda solo en stripLeakedReasoningPreamble() más
+        // abajo — defensivo, no cambia el request.
       },
       { headers, timeout: 30000 }
     );
     const msg = response.data.choices[0].message;
 
     if (!msg.tool_calls || !msg.tool_calls.length) {
-      console.log(`[chatWithTools] ${providerLabel}/${model} ronda ${round + 1}/3: respuesta final sin tool_calls.`);
+      console.log(`[chatWithTools] ${providerLabel}/${model} ronda ${round + 1}/${MAX_ROUNDS}: respuesta final sin tool_calls.`);
       // Red de seguridad de código (no solo prompt): encontrado en vivo (28/07/2026) que incluso
       // el modelo default a veces, sin llamar ninguna herramienta, escribe en texto libre una
       // "confirmación" con ✅/❌ que no es un botón real — pasó con papelera en lote y con un plan
       // inventado de "borro y creo de nuevo" un evento. No confiamos en que el modelo se autocorrija:
       // si el texto tiene la firma de una confirmación de acción falsa, se bloquea acá mismo.
       if (looksLikeFakeActionConfirmation(msg.content) || looksLikeFakeCompletedGatedAction(msg.content)) {
-        console.log(`[chatWithTools] ${providerLabel}/${model} ronda ${round + 1}/3: respuesta bloqueada por firma de confirmación/acción falsa: ${JSON.stringify(msg.content?.slice(0, 200))}`);
+        console.log(`[chatWithTools] ${providerLabel}/${model} ronda ${round + 1}/${MAX_ROUNDS}: respuesta bloqueada por firma de confirmación/acción falsa: ${JSON.stringify(msg.content?.slice(0, 200))}`);
         return 'No pude armar esa acción de forma segura. Pedímelo de nuevo mencionando una sola acción concreta por vez (ej. "mové a la papelera el mail con id X", o "editá el evento con id Y") y debería funcionar.';
+      }
+      // Firma 3 (31/07/2026): acción libre de Tasks declarada como hecha sin haber llamado a la
+      // herramienta en ningún punto de este intercambio — ver looksLikeFakeCompletedTasksAction.
+      if (looksLikeFakeCompletedTasksAction(msg.content, calledTools)) {
+        console.log(`[chatWithTools] ${providerLabel}/${model} ronda ${round + 1}/${MAX_ROUNDS}: respuesta bloqueada por firma de acción de Tasks inventada (sin tool_calls reales en el intercambio): ${JSON.stringify(msg.content?.slice(0, 200))}`);
+        return 'No pude confirmar esa acción de Tasks de forma segura. Pedímelo de nuevo mencionando una sola acción concreta por vez y debería funcionar.';
+      }
+      // Firma 4 (31/07/2026): chequeo por título exacto, más fino que la Firma 3 — con MÁS de un
+      // ítem en el pedido, alcanza con que UNO sea real para que el resto se cuele inventado en el
+      // mismo mensaje (visto en vivo: "ventiladores tres" real + "comer perro" inventada juntas).
+      if (looksLikeFakeCreatedTaskTitle(msg.content, actionedTitles)) {
+        console.log(`[chatWithTools] ${providerLabel}/${model} ronda ${round + 1}/${MAX_ROUNDS}: respuesta bloqueada por firma de título de tarea inventado (no coincide con ninguna llamada real): ${JSON.stringify(msg.content?.slice(0, 200))}`);
+        return 'No pude confirmar todos los ítems de forma segura. Pedímelo de nuevo mencionando uno por uno y debería funcionar.';
       }
       const cleanContent = stripLeakedReasoningPreamble(msg.content);
       if (cleanContent !== msg.content) {
-        console.log(`[chatWithTools] ${providerLabel}/${model} ronda ${round + 1}/3: preámbulo de razonamiento filtrado cortado: ${JSON.stringify(msg.content?.slice(0, 200))}`);
+        console.log(`[chatWithTools] ${providerLabel}/${model} ronda ${round + 1}/${MAX_ROUNDS}: preámbulo de razonamiento filtrado cortado: ${JSON.stringify(msg.content?.slice(0, 200))}`);
       }
       return cleanContent;
     }
 
     lastToolNames = msg.tool_calls.map(tc => `${tc.function.name}(${tc.function.arguments})`);
-    console.log(`[chatWithTools] ${providerLabel}/${model} ronda ${round + 1}/3: pidió ${lastToolNames.join(', ')}`);
+    console.log(`[chatWithTools] ${providerLabel}/${model} ronda ${round + 1}/${MAX_ROUNDS}: pidió ${lastToolNames.join(', ')}`);
 
     if (onToolNotice) await onToolNotice(msg.tool_calls);
 
     convo.push({ role: 'assistant', content: msg.content || null, tool_calls: msg.tool_calls });
     for (const tc of msg.tool_calls) {
+      calledTools.add(tc.function.name);
+      if (tc.function.name === 'crear_tarea' || tc.function.name === 'editar_tarea') {
+        try {
+          const parsedArgs = JSON.parse(tc.function.arguments || '{}');
+          if (parsedArgs.title) actionedTitles.add(String(parsedArgs.title));
+        } catch { /* si el JSON de argumentos vino roto, executeToolCall ya lo va a reportar aparte */ }
+      }
       const result = await executeToolCall(tc, ctx);
       const resultStr = String(result);
-      console.log(`[chatWithTools] ${providerLabel}/${model} ronda ${round + 1}/3: resultado de ${tc.function.name} (${resultStr.length} chars): ${resultStr.slice(0, 300)}`);
+      console.log(`[chatWithTools] ${providerLabel}/${model} ronda ${round + 1}/${MAX_ROUNDS}: resultado de ${tc.function.name} (${resultStr.length} chars): ${resultStr.slice(0, 300)}`);
       convo.push({ role: 'tool', tool_call_id: tc.id, content: resultStr.slice(0, 4000) });
     }
     // Corte duro (no depende del modelo, ver comentario en askConfirmation): si esta ronda dejó
@@ -1588,11 +2015,11 @@ const SYSTEM_PROMPT_STATIC = `${SYSTEM_PROMPT}
 CATÁLOGO DE MODELOS DISPONIBLES (si te preguntan qué modelo conviene para una tarea, respondé con criterio usando esta info):
 ${buildModelCatalogText()}
 
-REGLA OPERATIVA DURA (no negociable, aplica siempre): para redactar/enviar mails, mover mails a la papelera, crear/editar/borrar eventos de Calendar, o crear/marcar tareas de Tasks, SIEMPRE llamá a la herramienta correspondiente (redactar_enviar_mail, mover_mail_papelera, crear_evento_calendar, editar_evento_calendar, borrar_evento_calendar, crear_tarea, marcar_tarea_completa). NUNCA describas en texto libre una confirmación, una vista previa con botones, o un resultado de esas acciones — los botones reales y la ejecución real los maneja el código, no vos. Si en tu historial de conversación ves turnos anteriores donde "vos" escribiste una confirmación en texto en vez de usar la herramienta, es un error viejo — no lo repitas ni lo imites. Si te piden algo que ninguna herramienta puede hacer de verdad (ej. un color/etiqueta de evento), decilo explícitamente — nunca inventes un plan alternativo (como "borro y creo de nuevo") narrado en texto: si existe una herramienta para lo que hace falta (ej. editar_evento_calendar), usala; si no existe, avisá la limitación real.
+REGLA OPERATIVA DURA (no negociable, aplica siempre): para redactar/enviar mails, mover mails a la papelera, crear/editar/borrar eventos de Calendar, o crear/editar/mover/marcar/descompletar/borrar tareas y listas de Tasks, SIEMPRE llamá a la herramienta correspondiente (redactar_enviar_mail, mover_mail_papelera, crear_evento_calendar, editar_evento_calendar, borrar_evento_calendar, crear_tarea, editar_tarea, mover_tarea, marcar_tarea_completa, descompletar_tarea, borrar_tarea, listar_listas_tareas, crear_lista_tareas, editar_lista_tareas, borrar_lista_tareas). NUNCA describas en texto libre una confirmación, una vista previa con botones, o un resultado de esas acciones — los botones reales y la ejecución real los maneja el código, no vos. Si en tu historial de conversación ves turnos anteriores donde "vos" escribiste una confirmación en texto en vez de usar la herramienta, es un error viejo — no lo repitas ni lo imites. Si te piden algo que ninguna herramienta puede hacer de verdad (ej. un recordatorio con hora en Tasks, o un color/etiqueta de evento), decilo explícitamente — nunca inventes un plan alternativo (como "borro y creo de nuevo") ni un resultado falso narrado en texto: si existe una herramienta para lo que hace falta (ej. editar_evento_calendar, editar_tarea, editar_lista_tareas), usala; si no existe, avisá la limitación real.
 
 REGLA OPERATIVA DURA — editar/borrar eventos de Calendar (no negociable, aplica siempre): para editar_evento_calendar o borrar_evento_calendar NUNCA le pidas el eventId a Mariano — es información interna de Google Calendar, engorrosa de conseguir a mano y no es su trabajo dártela. Si no tenés ya el eventId (por ejemplo porque vos mismo creaste el evento en este mismo chat), llamá primero a buscar_eventos_calendar con el título y/o fecha que Mariano te dio. Si aparece un solo resultado, mostraselo (título + horario) y pedile que confirme que es ese evento antes de editarlo o borrarlo. Si aparecen varios, mostrale la lista para que elija. Recién con la confirmación de Mariano usás el eventId real para editar_evento_calendar o borrar_evento_calendar.
 
-REGLA OPERATIVA DURA — marcar tareas de Tasks como completas (mismo criterio que Calendar, no negociable): para marcar_tarea_completa NUNCA le pidas el taskId a Mariano. Si no lo tenés ya, llamá primero a buscar_tareas con el título/tema que te dio. Si aparece una sola coincidencia, confirmá con él que es esa tarea antes de marcarla. Si aparecen varias, mostrale la lista para que elija. Recién con su confirmación usás el taskId real para marcar_tarea_completa.
+REGLA OPERATIVA DURA — marcar/descompletar/borrar tareas de Tasks, o borrar una lista (mismo criterio que Calendar, no negociable): para marcar_tarea_completa, descompletar_tarea, borrar_tarea o borrar_lista_tareas NUNCA le pidas el taskId/tasklistId a Mariano. Si no lo tenés ya, llamá primero a buscar_tareas (con incluirCompletadas:true si estás buscando una tarea ya completada para descompletar_tarea) o a listar_listas_tareas, y confirmá con él cuál es antes de actuar. Si aparece una sola coincidencia, confirmala; si aparecen varias, mostrale la lista para que elija. Recién con su confirmación usás el taskId/tasklistId real. Tené en cuenta que a diferencia de Calendar (papelera web) o Gmail (Papelera), borrar_tarea y borrar_lista_tareas NO tienen forma de recuperar lo borrado — por eso gatean con confirmación por botones igual que borrar_evento_calendar, mientras que marcar_tarea_completa y descompletar_tarea (reversibles entre sí) no gatean.
 
 REGLA OPERATIVA DURA — no confundir redactar_enviar_mail con mover_mail_papelera (bug real visto en vivo 29/07/2026): son operaciones OPUESTAS y no relacionadas — redactar_enviar_mail crea y manda un mail NUEVO que Mariano está dictando/escribiendo ahora; mover_mail_papelera borra un mail YA EXISTENTE en la bandeja de entrada. Si Mariano te pide "enviá un mail", "mandale un mail a X", o te dicta destinatario/asunto/cuerpo, es SIEMPRE redactar_enviar_mail — nunca mover_mail_papelera, aunque la dirección de destino te llegue con formato raro (típico de audio transcripto, ej. "nombre.com" en vez de "nombre@gmail.com"). Si la dirección no tiene forma de email válida, la herramienta te va a avisar — en ese caso preguntale a Mariano la dirección exacta en vez de inventar una acción distinta.`;
 
@@ -1821,8 +2248,26 @@ function withTimeout(promise, ms) {
 // ~15-20s) después. Un valor más alto (se probó 65s) dejaba pasar el TTS fuera del handlerTimeout de 90s.
 const AI_TIMEOUT_MS = 40000;
 async function callAIWithTimeout(messages, config, onToolNotice, userId, ctx) {
-  const result = await withTimeout(callAI(messages, config, onToolNotice, userId, ctx), AI_TIMEOUT_MS);
-  return result === null ? 'Perdón, tardé demasiado en responder. Probá de nuevo o reformulá la pregunta.' : result;
+  const workPromise = callAI(messages, config, onToolNotice, userId, ctx);
+  const result = await withTimeout(workPromise, AI_TIMEOUT_MS);
+  if (result === null) {
+    // Promise.race no cancela workPromise — sigue corriendo en segundo plano aunque ya le
+    // avisamos a Mariano que "tardamos demasiado". Bug real visto en vivo (31/07/2026): un pedido
+    // de subtareas de Tasks superó los 40s, Mariano leyó "tardé demasiado, probá de nuevo" y
+    // reformuló el mismo pedido — como las llamadas del primer intento (crear_tarea, etc.)
+    // terminaron igual en segundo plano sin que nadie las viera, el reintento las duplicó. Ahora,
+    // cuando el trabajo tardío termine, se lo mandamos como mensaje de seguimiento en vez de
+    // descartarlo en silencio — así Mariano ve el resultado real antes de decidir si reformular.
+    workPromise
+      .then(async (lateResult) => {
+        if (!lateResult || lateResult === GATED_NO_REPLY) return; // GATED_NO_REPLY: la UI de confirmación ya se mandó sola
+        await saveMessage(userId, 'assistant', lateResult);
+        await ctx.reply(`⏱️ Esto se terminó de procesar después de avisarte que tardaba — el resultado real fue:\n\n${lateResult}`, { parse_mode: 'Markdown' });
+      })
+      .catch((error) => console.error('[callAIWithTimeout] error en trabajo tardío:', error.message));
+    return 'Perdón, tardé demasiado en responder. Probá de nuevo o reformulá la pregunta.';
+  }
+  return result;
 }
 
 async function replyWithAudio(ctx, text) {
