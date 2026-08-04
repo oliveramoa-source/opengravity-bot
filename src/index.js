@@ -8,8 +8,10 @@ const { Telegraf } = require('telegraf');
 const axios = require('axios');
 const fs = require('fs');
 const http = require('http');
+const crypto = require('crypto');
 const { MsEdgeTTS, OUTPUT_FORMAT } = require('msedge-tts');
 const { google } = require('googleapis');
+const { SecretManagerServiceClient } = require('@google-cloud/secret-manager');
 
 // ─────────────────────────────────────────
 // FIREBASE ADMIN
@@ -82,20 +84,78 @@ const GOOGLE_OAUTH_SCOPES = [
   'https://www.googleapis.com/auth/tasks',
 ];
 
+// Ruta pública que recibe el redirect de Google al completar el consent screen (ítem 97 fix): sin
+// esto el link de reautorización de Telegram llegaba a la pantalla de Google y no volvía a ningún
+// lado — el cliente OAuth de "escritorio" original no soporta redirect https propio, por eso este
+// flujo requiere un cliente OAuth tipo "Aplicación web" con esta URL registrada como redirect autorizado.
+const OAUTH_CALLBACK_PATH = '/oauth/callback';
+const OAUTH_REDIRECT_URI = process.env.WEBHOOK_URL ? `${process.env.WEBHOOK_URL}${OAUTH_CALLBACK_PATH}` : undefined;
+
 const googleOAuthClient = new google.auth.OAuth2(
   process.env.GOOGLE_OAUTH_CLIENT_ID,
-  process.env.GOOGLE_OAUTH_CLIENT_SECRET
+  process.env.GOOGLE_OAUTH_CLIENT_SECRET,
+  OAUTH_REDIRECT_URI
 );
 if (process.env.GOOGLE_OAUTH_REFRESH_TOKEN) {
   googleOAuthClient.setCredentials({ refresh_token: process.env.GOOGLE_OAUTH_REFRESH_TOKEN });
 }
 
+// Estado de un solo uso para el link de reautorización en curso: evita que un GET arbitrario a
+// OAUTH_CALLBACK_PATH (la ruta es pública, no pasa por la allowlist de Telegram) con un `code`
+// cualquiera pueda pisar el refresh token guardado — solo se acepta el code si viene acompañado
+// del `state` que generamos nosotros al mandar el link, y solo una vez.
+let pendingOAuthState = null;
+
 function buildReauthUrl() {
+  pendingOAuthState = { value: crypto.randomBytes(16).toString('hex'), expiresAt: Date.now() + 10 * 60 * 1000 };
   return googleOAuthClient.generateAuthUrl({
     access_type: 'offline',
     prompt: 'consent',
     scope: GOOGLE_OAUTH_SCOPES,
+    state: pendingOAuthState.value,
   });
+}
+
+const GCP_PROJECT_ID = 'opengravity-bot-717d4';
+const secretManagerClient = new SecretManagerServiceClient();
+
+// Persiste el refresh_token nuevo en Secret Manager (misma lógica que scripts/oauth-setup.js,
+// vía API en vez de gcloud CLI porque Cloud Run no tiene el binario de gcloud disponible) — sin
+// esto, el próximo cold start del contenedor volvería a arrancar con el token vencido.
+async function persistRefreshToken(refreshToken) {
+  await secretManagerClient.addSecretVersion({
+    parent: `projects/${GCP_PROJECT_ID}/secrets/google-oauth-refresh-token`,
+    payload: { data: Buffer.from(refreshToken, 'utf8') },
+  });
+}
+
+// Completa el intercambio code -> tokens iniciado por buildReauthUrl(), actualiza las
+// credenciales en memoria para que el bot vuelva a operar sin esperar un redeploy, persiste el
+// refresh_token nuevo, y avisa por Telegram (éxito o error) — nunca falla en silencio.
+async function completeOAuthCallback(code) {
+  try {
+    const { tokens } = await googleOAuthClient.getToken(code);
+    if (!tokens.refresh_token) {
+      await bot.telegram.sendMessage(
+        process.env.TELEGRAM_ALLOWED_USER_ID,
+        '⚠️ La reautorización no devolvió un refresh token nuevo (puede pasar si ya habías autorizado antes sin forzar consentimiento). Revocá el acceso en https://myaccount.google.com/permissions y pedime el link de nuevo.'
+      );
+      return;
+    }
+    googleOAuthClient.setCredentials(tokens);
+    await persistRefreshToken(tokens.refresh_token);
+    googleOAuthExpired = false;
+    await bot.telegram.sendMessage(process.env.TELEGRAM_ALLOWED_USER_ID, '✅ Reautorización completa. Gmail/Calendar/Tasks vuelven a andar normal.');
+    await logAccion({
+      accion: 'oauth_reautorizacion_completada',
+      destinatario_o_archivo: 'google-oauth-refresh-token',
+      confirmada: true,
+      resultado: 'refresh_token renovado y persistido en Secret Manager',
+    });
+  } catch (error) {
+    console.error('Error completando la reautorización OAuth:', error.message);
+    await bot.telegram.sendMessage(process.env.TELEGRAM_ALLOWED_USER_ID, `⚠️ Error completando la reautorización: ${error.message}`);
+  }
 }
 
 const gmailClient = google.gmail({ version: 'v1', auth: googleOAuthClient });
@@ -122,10 +182,10 @@ async function handleOAuthExpiry(userId, error) {
   try {
     await bot.telegram.sendMessage(
       userId,
-      `⚠️ *El token de Gmail/Calendar/Tasks venció.*\n\n` +
+      `⚠️ <b>El token de Gmail/Calendar/Tasks venció.</b>\n\n` +
       `Es esperable (modo Testing, ciclo de 7 días) — no es un error del Bot.\n\n` +
-      `Reautorizá acá (un clic, después el Bot vuelve a andar normal):\n${reauthUrl}`,
-      { parse_mode: 'Markdown' }
+      `Reautorizá acá (un clic, después el Bot vuelve a andar normal):\n<a href="${reauthUrl}">Reautorizar</a>`,
+      { parse_mode: 'HTML' }
     );
   } catch (sendError) {
     console.error('Error avisando vencimiento de OAuth por Telegram:', sendError.message);
@@ -2731,6 +2791,29 @@ async function startBot() {
           console.error('Error parseando update de Telegram:', err.message);
         }
       });
+      return;
+    }
+    if (req.method === 'GET' && req.url.startsWith(OAUTH_CALLBACK_PATH)) {
+      const params = new URL(req.url, OAUTH_REDIRECT_URI || 'http://localhost').searchParams;
+      const code = params.get('code');
+      const errorParam = params.get('error');
+      const state = params.get('state');
+      res.writeHead(200, { 'Content-Type': 'text/html; charset=utf-8' });
+      if (errorParam) {
+        res.end('<h2>Autorización cancelada o denegada. Podés cerrar esta pestaña.</h2>');
+        return;
+      }
+      if (!pendingOAuthState || state !== pendingOAuthState.value || Date.now() > pendingOAuthState.expiresAt) {
+        res.end('<h2>Este link de reautorización venció o ya se usó. Pedile uno nuevo al Bot.</h2>');
+        return;
+      }
+      if (!code) {
+        res.end('<h2>Falta el parámetro code en la respuesta de Google.</h2>');
+        return;
+      }
+      pendingOAuthState = null;
+      res.end('<h2>✅ Reautorización recibida, procesando... Ya podés cerrar esta pestaña, el Bot te avisa por Telegram.</h2>');
+      completeOAuthCallback(code);
       return;
     }
     res.writeHead(404);
