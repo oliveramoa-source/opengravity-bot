@@ -1761,6 +1761,57 @@ function stripLeakedReasoningPreamble(text) {
   return cleaned;
 }
 
+// Firma 6 (05/08/2026): el modelo presentando una tabla/lista de resultados de una herramienta de
+// LECTURA (buscar_tareas, leer_mails_recientes, buscar_eventos_calendar) sin haberla llamado en
+// este intercambio. Distinto de las Firmas 2-5 (que cubren ACCIONES declaradas como "ya hechas"):
+// acá no hay un verbo de acción completada, es una narrativa de datos que nunca se consultaron en
+// esta ronda. Bug real visto en vivo: pedido "mail → evento → cruce con tareas pendientes" en el
+// que el modelo llamó leer_mails_recientes y buscar_eventos_calendar pero NUNCA buscar_tareas, y
+// aun así devolvió una tabla "Cruce con tus tareas pendientes" con títulos reales.
+//
+// Mecanismo confirmado por código antes de escribir esto (no asumido): `messages` — el parámetro
+// de entrada de chatWithTools, con el historial persistido de Firestore ya cargado por getHistory
+// más el mensaje nuevo — es lo único que el modelo ve de turnos anteriores. Los resultados crudos
+// de tool-calls (role:'tool') NUNCA se persisten entre turnos (saveMessage solo guarda texto
+// user/assistant); solo la respuesta final en texto de una ronda anterior queda en el historial. En
+// el caso real, los títulos de tareas fabricados coincidían EXACTO con una respuesta real de
+// buscar_tareas de un turno anterior de la misma conversación (guardada como texto) — el modelo los
+// reusó de memoria conversacional real en vez de re-consultar. Eso es distinto de inventar de la
+// nada: por eso esta firma cruza contra el historial antes de bloquear, y solo bloquea si el dato
+// no aparece en NINGÚN lado (ni tool-call de esta ronda, ni historial real de turnos anteriores).
+const READ_TOOL_SIGNATURES = [
+  { tool: 'buscar_tareas', header: /\b(tareas?\s+pendientes?|cruce\s+con\s+(tus?\s+)?tareas?|lista\s+de\s+tareas?)\b/i },
+  { tool: 'leer_mails_recientes', header: /\b(mails?\s+recientes?|correos?\s+recientes?|último\s+mail|últimos?\s+mails?)\b/i },
+  { tool: 'buscar_eventos_calendar', header: /\beventos?\b[^.\n]{0,25}\bcalendar\b|\bagenda(?:do|dos)?\s+ese\s+(?:mismo\s+)?d[ií]a\b/i },
+];
+// Normaliza para comparar texto nuevo contra historial sin que el formato Markdown (tablas,
+// negritas) haga fallar una coincidencia real.
+function normalizeForReadCompare(s) {
+  return s.replace(/[|*_`#>-]/g, ' ').replace(/\s+/g, ' ').trim().toLowerCase();
+}
+function looksLikeFakeReadResult(text, calledTools, historyMessages) {
+  if (!text) return false;
+  // Necesita evidencia de datos enumerados (tabla o lista real), no solo mencionar el tema de paso.
+  const hasEnumeratedData = /\|.+\|.+\|/.test(text) || (text.match(/^[-•]\s+.+$/gm) || []).length >= 2;
+  if (!hasEnumeratedData) return false;
+  const historyText = normalizeForReadCompare(historyMessages.map((m) => String(m.content || '')).join('\n'));
+  for (const sig of READ_TOOL_SIGNATURES) {
+    if (calledTools.has(sig.tool)) continue; // se llamó de verdad en esta ronda, no hay nada sospechoso
+    if (!sig.header.test(text)) continue;
+    // ¿Los datos ya aparecieron en una respuesta REAL de un turno anterior de esta conversación?
+    const candidateLines = text.split('\n').filter((l) => /[a-záéíóúñ]{3,}/i.test(l));
+    const reusedFromHistory = candidateLines.some((line) => {
+      // Una fila de tabla nueva mezcla el título real con columnas inventadas (ej. "conexión
+      // lavarropas | No") — probamos la línea entera Y cada celda por separado.
+      const cells = line.split('|').map(normalizeForReadCompare).filter((c) => c.length > 4);
+      const candidates = [normalizeForReadCompare(line), ...cells];
+      return candidates.some((c) => c.length > 4 && historyText.includes(c));
+    });
+    if (!reusedFromHistory) return true; // no se llamó Y no está en el historial real: inventado
+  }
+  return false;
+}
+
 async function chatWithTools(url, apiKey, model, messages, onToolNotice, ctx) {
   const headers = { 'Content-Type': 'application/json', Authorization: `Bearer ${apiKey}` };
   let convo = [...messages];
@@ -1830,6 +1881,14 @@ async function chatWithTools(url, apiKey, model, messages, onToolNotice, ctx) {
         console.log(`[chatWithTools] ${providerLabel}/${model} ronda ${round + 1}/${MAX_ROUNDS}: respuesta bloqueada por firma de vencimiento OAuth inventado (googleOAuthExpired=false): ${JSON.stringify(msg.content?.slice(0, 200))}`);
         return 'Hubo un problema ejecutando esa acción, pero no fue un token vencido (el token está OK). Pedímelo de nuevo — si vuelve a fallar, avisame el error real en vez de que yo invente una causa.';
       }
+      // Firma 6 (05/08/2026): tabla/lista de resultados de una herramienta de LECTURA (Tasks/Mail/
+      // Calendar) sin haberla llamado en este intercambio NI aparecer en el historial real de la
+      // conversación (ver looksLikeFakeReadResult) — distingue reuso legítimo de datos reales vistos
+      // antes en esta misma conversación de invención pura.
+      if (looksLikeFakeReadResult(msg.content, calledTools, messages)) {
+        console.log(`[chatWithTools] ${providerLabel}/${model} ronda ${round + 1}/${MAX_ROUNDS}: respuesta bloqueada por firma de resultado de lectura inventado (sin tool-call real ni respaldo en el historial): ${JSON.stringify(msg.content?.slice(0, 200))}`);
+        return 'No pude confirmar esos datos de forma segura — no llegué a consultarlos de nuevo. Pedímelo otra vez y me fijo con una búsqueda real antes de responder.';
+      }
       const cleanContent = stripLeakedReasoningPreamble(msg.content);
       if (cleanContent !== msg.content) {
         console.log(`[chatWithTools] ${providerLabel}/${model} ronda ${round + 1}/${MAX_ROUNDS}: preámbulo de razonamiento filtrado cortado: ${JSON.stringify(msg.content?.slice(0, 200))}`);
@@ -1875,40 +1934,56 @@ async function chatWithTools(url, apiKey, model, messages, onToolNotice, ctx) {
   // Google, no por generar texto de cierre). closingMs queda en el log para confirmar en vivo que
   // esta ronda extra no reintroduce el riesgo de pisar el timeout general de 40s (AI_TIMEOUT_MS).
   console.log(`[chatWithTools] ${providerLabel}/${model}: se agotaron las ${MAX_ROUNDS} rondas de herramientas, pidiendo ronda de cierre (tool_choice:'none').`);
+  // Bug real visto en vivo (05/08/2026, revisión 00047-7qj): la ronda de cierre a veces vuelve con
+  // `content` vacío (27.6s, sin ningún error — gpt-oss a veces se come el budget en razonamiento
+  // oculto, mismo fenómeno documentado en el health check de arranque) y antes se rendía directo
+  // con el mensaje genérico, tirando a la basura los datos reales ya juntados en `convo`. Ahora
+  // reintenta UNA vez más antes de rendirse — mismo `tool_choice:'none'`, no agrega llamadas reales
+  // a Google, solo un segundo intento de redactar con los mismos datos.
+  const MAX_CLOSING_ATTEMPTS = 2;
   try {
-    const closingStart = Date.now();
-    const closingResponse = await axios.post(
-      url,
-      { model, messages: convo, temperature: 0.5, tools: TOOL_DEFS, tool_choice: 'none' },
-      { headers, timeout: 30000 }
-    );
-    const closingMs = Date.now() - closingStart;
-    const closingMsg = closingResponse.data.choices[0].message;
-    console.log(`[chatWithTools] ${providerLabel}/${model}: ronda de cierre tardó ${closingMs}ms.`);
+    for (let attempt = 1; attempt <= MAX_CLOSING_ATTEMPTS; attempt++) {
+      const closingStart = Date.now();
+      const closingResponse = await axios.post(
+        url,
+        { model, messages: convo, temperature: 0.5, tools: TOOL_DEFS, tool_choice: 'none' },
+        { headers, timeout: 30000 }
+      );
+      const closingMs = Date.now() - closingStart;
+      const closingMsg = closingResponse.data.choices[0].message;
+      console.log(`[chatWithTools] ${providerLabel}/${model}: ronda de cierre (intento ${attempt}/${MAX_CLOSING_ATTEMPTS}) tardó ${closingMs}ms.`);
 
-    // Mismas firmas anti-invención que arriba — una ronda sin tool_calls sigue siendo texto libre
-    // del modelo, así que puede colar la misma narrativa falsa que en una ronda normal.
-    if (looksLikeFakeActionConfirmation(closingMsg.content) || looksLikeFakeCompletedGatedAction(closingMsg.content)) {
-      console.log(`[chatWithTools] ${providerLabel}/${model}: cierre bloqueado por firma de confirmación/acción falsa: ${JSON.stringify(closingMsg.content?.slice(0, 200))}`);
-      return 'No pude armar esa acción de forma segura. Pedímelo de nuevo mencionando una sola acción concreta por vez (ej. "mové a la papelera el mail con id X", o "editá el evento con id Y") y debería funcionar.';
+      if (!closingMsg.content) {
+        console.log(`[chatWithTools] ${providerLabel}/${model}: ronda de cierre (intento ${attempt}/${MAX_CLOSING_ATTEMPTS}) volvió sin contenido.`);
+        continue; // reintenta si queda otro intento; si no, cae al mensaje genérico después del for
+      }
+
+      // Mismas firmas anti-invención que arriba — una ronda sin tool_calls sigue siendo texto libre
+      // del modelo, así que puede colar la misma narrativa falsa que en una ronda normal.
+      if (looksLikeFakeActionConfirmation(closingMsg.content) || looksLikeFakeCompletedGatedAction(closingMsg.content)) {
+        console.log(`[chatWithTools] ${providerLabel}/${model}: cierre bloqueado por firma de confirmación/acción falsa: ${JSON.stringify(closingMsg.content?.slice(0, 200))}`);
+        return 'No pude armar esa acción de forma segura. Pedímelo de nuevo mencionando una sola acción concreta por vez (ej. "mové a la papelera el mail con id X", o "editá el evento con id Y") y debería funcionar.';
+      }
+      if (looksLikeFakeCompletedTasksAction(closingMsg.content, calledTools)) {
+        console.log(`[chatWithTools] ${providerLabel}/${model}: cierre bloqueado por firma de acción de Tasks inventada: ${JSON.stringify(closingMsg.content?.slice(0, 200))}`);
+        return 'No pude confirmar esa acción de Tasks de forma segura. Pedímelo de nuevo mencionando una sola acción concreta por vez y debería funcionar.';
+      }
+      if (looksLikeFakeCreatedTaskTitle(closingMsg.content, actionedTitles)) {
+        console.log(`[chatWithTools] ${providerLabel}/${model}: cierre bloqueado por firma de título de tarea inventado: ${JSON.stringify(closingMsg.content?.slice(0, 200))}`);
+        return 'No pude confirmar todos los ítems de forma segura. Pedímelo de nuevo mencionando uno por uno y debería funcionar.';
+      }
+      if (looksLikeFakeOAuthExpiryNarrative(closingMsg.content)) {
+        console.log(`[chatWithTools] ${providerLabel}/${model}: cierre bloqueado por firma de vencimiento OAuth inventado: ${JSON.stringify(closingMsg.content?.slice(0, 200))}`);
+        return 'Hubo un problema ejecutando esa acción, pero no fue un token vencido (el token está OK). Pedímelo de nuevo — si vuelve a fallar, avisame el error real en vez de que yo invente una causa.';
+      }
+      if (looksLikeFakeReadResult(closingMsg.content, calledTools, messages)) {
+        console.log(`[chatWithTools] ${providerLabel}/${model}: cierre bloqueado por firma de resultado de lectura inventado: ${JSON.stringify(closingMsg.content?.slice(0, 200))}`);
+        return 'No pude confirmar esos datos de forma segura — no llegué a consultarlos de nuevo. Pedímelo otra vez y me fijo con una búsqueda real antes de responder.';
+      }
+      return stripLeakedReasoningPreamble(closingMsg.content);
     }
-    if (looksLikeFakeCompletedTasksAction(closingMsg.content, calledTools)) {
-      console.log(`[chatWithTools] ${providerLabel}/${model}: cierre bloqueado por firma de acción de Tasks inventada: ${JSON.stringify(closingMsg.content?.slice(0, 200))}`);
-      return 'No pude confirmar esa acción de Tasks de forma segura. Pedímelo de nuevo mencionando una sola acción concreta por vez y debería funcionar.';
-    }
-    if (looksLikeFakeCreatedTaskTitle(closingMsg.content, actionedTitles)) {
-      console.log(`[chatWithTools] ${providerLabel}/${model}: cierre bloqueado por firma de título de tarea inventado: ${JSON.stringify(closingMsg.content?.slice(0, 200))}`);
-      return 'No pude confirmar todos los ítems de forma segura. Pedímelo de nuevo mencionando uno por uno y debería funcionar.';
-    }
-    if (looksLikeFakeOAuthExpiryNarrative(closingMsg.content)) {
-      console.log(`[chatWithTools] ${providerLabel}/${model}: cierre bloqueado por firma de vencimiento OAuth inventado: ${JSON.stringify(closingMsg.content?.slice(0, 200))}`);
-      return 'Hubo un problema ejecutando esa acción, pero no fue un token vencido (el token está OK). Pedímelo de nuevo — si vuelve a fallar, avisame el error real en vez de que yo invente una causa.';
-    }
-    if (!closingMsg.content) {
-      console.log(`[chatWithTools] ${providerLabel}/${model}: ronda de cierre volvió sin contenido. Último intento: ${lastToolNames.join(', ') || 'ninguno'}`);
-      return 'No pude completar la respuesta tras varias búsquedas. Probá reformular la pregunta.';
-    }
-    return stripLeakedReasoningPreamble(closingMsg.content);
+    console.log(`[chatWithTools] ${providerLabel}/${model}: ronda de cierre volvió sin contenido en los ${MAX_CLOSING_ATTEMPTS} intentos. Último intento de herramienta: ${lastToolNames.join(', ') || 'ninguno'}`);
+    return 'No pude completar la respuesta tras varias búsquedas. Probá reformular la pregunta.';
   } catch (error) {
     console.error(`[chatWithTools] ${providerLabel}/${model}: error en la ronda de cierre:`, error.response?.data || error.message);
     console.log(`[chatWithTools] ${providerLabel}/${model}: se quedó sin rondas (incluida la de cierre). Último intento: ${lastToolNames.join(', ') || 'ninguno'}`);
