@@ -13,6 +13,18 @@ const { MsEdgeTTS, OUTPUT_FORMAT } = require('msedge-tts');
 const { google } = require('googleapis');
 const { SecretManagerServiceClient } = require('@google-cloud/secret-manager');
 
+// Escapa el texto dinámico que se interpola dentro de mensajes con parse_mode 'HTML' (ítem 112):
+// a diferencia de Markdown, HTML no tiene el problema de que un `_` de más rompa el parseo, pero
+// sí rompe si el texto dinámico (ids, títulos, resultados de IA) trae `&`, `<` o `>` literales —
+// Telegram los interpretaría como el inicio de una entidad HTML. Nunca aplicar esto a los tags que
+// nosotros mismos escribimos (`<b>`, `<a href=...>`), solo al contenido variable.
+function escapeHtml(value) {
+  return String(value ?? '')
+    .replace(/&/g, '&amp;')
+    .replace(/</g, '&lt;')
+    .replace(/>/g, '&gt;');
+}
+
 // ─────────────────────────────────────────
 // FIREBASE ADMIN
 // ─────────────────────────────────────────
@@ -712,9 +724,9 @@ async function askConfirmation(ctx, { kind, preview, payload }) {
   // en el código: chatWithTools revisa esta bandera y no deja que el modelo agregue nada más.
   if (ctx) ctx.__awaitingConfirmation = true;
   const sentMsg = await ctx.reply(
-    `${preview}\n\n_Tipeá *${action.letter}* para ${action.display.toLowerCase()}, *C* para cancelar, o escribí una corrección._`,
+    `${preview}\n\n<i>Tipeá <b>${action.letter}</b> para ${escapeHtml(action.display.toLowerCase())}, <b>C</b> para cancelar, o escribí una corrección.</i>`,
     {
-      parse_mode: 'Markdown',
+      parse_mode: 'HTML',
       reply_markup: {
         inline_keyboard: [[
           { text: `✅ ${action.display}`, callback_data: `confirm_${id}` },
@@ -742,7 +754,7 @@ async function finalizeDraftMessage(ctx, pending, resultLine) {
     await ctx.telegram.editMessageText(
       pending.chatId, pending.messageId, undefined,
       `${pending.preview}\n\n${resultLine}`,
-      { parse_mode: 'Markdown', reply_markup: { inline_keyboard: [] } }
+      { parse_mode: 'HTML', reply_markup: { inline_keyboard: [] } }
     );
     return true;
   } catch (error) {
@@ -784,7 +796,7 @@ async function runPendingAction({ kind, payload, userId }) {
 
 function formatConfirmationOutcome(result) {
   if (result.expired) return '⚠️ No pude ejecutarlo: el token de Gmail/Calendar venció. Ya te mandé el link de reautorización.';
-  if (!result.ok) return `❌ Falló: ${result.error}`;
+  if (!result.ok) return `❌ Falló: ${escapeHtml(result.error)}`;
   return '✅ Listo, confirmado y ejecutado.';
 }
 
@@ -798,7 +810,7 @@ bot.action(/^confirm_(\d+)$/, async (ctx) => {
   // Pedido de Mariano (29/07/2026): el borrador queda de registro visible, solo se sacan los
   // botones y se suma el resultado — no se reemplaza todo por un mensaje genérico.
   return ctx.editMessageText(`${pending.preview}\n\n${formatConfirmationOutcome(result)}`, {
-    parse_mode: 'Markdown',
+    parse_mode: 'HTML',
     reply_markup: { inline_keyboard: [] },
   });
 });
@@ -810,7 +822,7 @@ bot.action(/^cancel_(\d+)$/, async (ctx) => {
   await ctx.answerCbQuery();
   const previewPrefix = pending ? `${pending.preview}\n\n` : '';
   return ctx.editMessageText(`${previewPrefix}❌ Cancelado, no se hizo nada.`, {
-    parse_mode: 'Markdown',
+    parse_mode: 'HTML',
     reply_markup: { inline_keyboard: [] },
   });
 });
@@ -1343,7 +1355,7 @@ const TOOL_HANDLERS = {
     await askConfirmation(ctx, {
       kind: 'email_send',
       payload: { to, subject, body },
-      preview: `📧 *¿Envío este mail?*\n\nPara: ${to}\nAsunto: ${subject}\n\n"${primeraLinea.slice(0, 200)}"`,
+      preview: `📧 <b>¿Envío este mail?</b>\n\nPara: ${escapeHtml(to)}\nAsunto: ${escapeHtml(subject)}\n\n"${escapeHtml(primeraLinea.slice(0, 200))}"`,
     });
     return 'Le mostré la propuesta a Mariano con botones de confirmación — no se envió todavía.';
   },
@@ -1380,16 +1392,16 @@ const TOOL_HANDLERS = {
       const msgResult = await callGoogleAPI(ctx.from.id, () =>
         gmailClient.users.messages.get({ userId: 'me', id, format: 'metadata', metadataHeaders: ['From', 'Subject'] })
       );
-      if (!msgResult.ok) { listado.push(`• ${id} (no pude leer el detalle)`); continue; }
+      if (!msgResult.ok) { listado.push(`• ${escapeHtml(id)} (no pude leer el detalle)`); continue; }
       const headers = msgResult.data.data.payload?.headers || [];
       const from = headers.find((h) => h.name === 'From')?.value || '(sin remitente)';
       const subject = headers.find((h) => h.name === 'Subject')?.value || '(sin asunto)';
-      listado.push(`• ${subject} — ${from}\n  (id: ${id})`);
+      listado.push(`• ${escapeHtml(subject)} — ${escapeHtml(from)}\n  (id: ${escapeHtml(id)})`);
     }
     await askConfirmation(ctx, {
       kind: 'email_trash',
       payload: { messageIds: ids },
-      preview: `🗑️ *¿Muevo ${ids.length === 1 ? 'este mail' : `estos ${ids.length} mails`} a la papelera?*\n\n${listado.join('\n')}\n\n(Queda recuperable ~30 días)`,
+      preview: `🗑️ <b>¿Muevo ${ids.length === 1 ? 'este mail' : `estos ${ids.length} mails`} a la papelera?</b>\n\n${listado.join('\n')}\n\n(Queda recuperable ~30 días)`,
     });
     return 'Le mostré la confirmación a Mariano — no se movió nada todavía.';
   },
@@ -1400,7 +1412,7 @@ const TOOL_HANDLERS = {
       await askConfirmation(ctx, {
         kind: 'calendar_event',
         payload: { summary, description, start, end, attendees, reminderMinutes },
-        preview: `📅 *¿Creo este evento con invitados?*\n\n${summary}\n${start} → ${end}\nInvitados: ${attendees.join(', ')}${reminderMinutes ? `\nRecordatorio: ${reminderMinutes} min antes` : ''}`,
+        preview: `📅 <b>¿Creo este evento con invitados?</b>\n\n${escapeHtml(summary)}\n${escapeHtml(start)} → ${escapeHtml(end)}\nInvitados: ${escapeHtml(attendees.join(', '))}${reminderMinutes ? `\nRecordatorio: ${reminderMinutes} min antes` : ''}`,
       });
       return 'Tiene invitados, le mostré la confirmación a Mariano antes de crearlo.';
     }
@@ -1432,7 +1444,7 @@ const TOOL_HANDLERS = {
       await askConfirmation(ctx, {
         kind: 'calendar_update',
         payload: { eventId, summary, description, start, end, attendees, reminderMinutes },
-        preview: `📅 *¿Edito este evento con invitados?*\n\nID: ${eventId}${summary ? `\nTítulo: ${summary}` : ''}${start ? `\n${start} → ${end}` : ''}\nInvitados: ${attendees.join(', ')}`,
+        preview: `📅 <b>¿Edito este evento con invitados?</b>\n\nID: ${escapeHtml(eventId)}${summary ? `\nTítulo: ${escapeHtml(summary)}` : ''}${start ? `\n${escapeHtml(start)} → ${escapeHtml(end)}` : ''}\nInvitados: ${escapeHtml(attendees.join(', '))}`,
       });
       return 'Tiene invitados, le mostré la confirmación a Mariano antes de editarlo.';
     }
@@ -1447,7 +1459,7 @@ const TOOL_HANDLERS = {
     await askConfirmation(ctx, {
       kind: 'calendar_delete',
       payload: { eventId, hasAttendees: !!tieneInvitados },
-      preview: `🗑️ *¿Borro este evento?*\n\nID: ${eventId}${tieneInvitados ? '\n⚠️ Tiene invitados, se les va a notificar el borrado.' : ''}`,
+      preview: `🗑️ <b>¿Borro este evento?</b>\n\nID: ${escapeHtml(eventId)}${tieneInvitados ? '\n⚠️ Tiene invitados, se les va a notificar el borrado.' : ''}`,
     });
     return 'Le mostré la confirmación a Mariano — no se borró todavía.';
   },
@@ -1484,7 +1496,7 @@ const TOOL_HANDLERS = {
     await askConfirmation(ctx, {
       kind: 'tasks_delete_list',
       payload: { tasklistId },
-      preview: `🗑️ *¿Borro la lista "${nombreLista}" y TODAS sus tareas?*\n\nID: ${tasklistId}\n⚠️ No hay papelera, es definitivo.`,
+      preview: `🗑️ <b>¿Borro la lista "${escapeHtml(nombreLista)}" y TODAS sus tareas?</b>\n\nID: ${escapeHtml(tasklistId)}\n⚠️ No hay papelera, es definitivo.`,
     });
     return 'Le mostré la confirmación a Mariano — no se borró todavía.';
   },
@@ -1546,7 +1558,7 @@ const TOOL_HANDLERS = {
     await askConfirmation(ctx, {
       kind: 'tasks_delete_item',
       payload: { taskId, tasklistId },
-      preview: `🗑️ *¿Borro esta tarea?*\n\n"${tituloTarea}"\nID: ${taskId}\n⚠️ No hay papelera, es definitivo.`,
+      preview: `🗑️ <b>¿Borro esta tarea?</b>\n\n"${escapeHtml(tituloTarea)}"\nID: ${escapeHtml(taskId)}\n⚠️ No hay papelera, es definitivo.`,
     });
     return 'Le mostré la confirmación a Mariano — no se borró todavía.';
   },
@@ -1686,6 +1698,22 @@ function looksLikeFakeCreatedTaskTitle(text, actionedTitles) {
   return false;
 }
 
+// Firma 5 (ítem 113, 05/08/2026): narrativa de vencimiento OAuth inventada. Evidencia real: una
+// captura de Mariano mostró al Bot mandando "Token de Google Calendar venció (modo Testing)...
+// https://auth.opengravity.bot/google-calendar-reauth?user=mariano" — ese dominio y esa función NO
+// existen en ningún lugar del código (confirmado por grep en todo el repo). La ÚNICA función real
+// que avisa un vencimiento es handleOAuthExpiry(): siempre manda el mismo texto fijo con la URL real
+// de accounts.google.com (nunca menciona un evento puntual por título), y solo se dispara cuando
+// googleOAuthExpired ya pasó a true. Si el texto final narra un vencimiento/reautorización de Google
+// mientras el estado real dice que NO está vencido, es invención del modelo — se bloquea igual que
+// las Firmas 2-4, no una "confirmación con botones falsos" sino su equivalente para un aviso de error.
+function looksLikeFakeOAuthExpiryNarrative(text) {
+  if (!text || googleOAuthExpired) return false; // si de verdad está vencido, la narrativa puede ser legítima
+  const expiryPhrase = /\b(token|acceso)\b[^.!?\n]{0,60}\b(venci[oó]|expir[oó])\b/i;
+  const reauthMention = /reautoriz|re-?autoriz/i;
+  return expiryPhrase.test(text) && reauthMention.test(text);
+}
+
 // Filtro defensivo contra el canal "analysis" (razonamiento oculto) de gpt-oss filtrándose al
 // content final — bug documentado upstream, no nuestro (ver handoff 30/07/2026). Visto una vez en
 // vivo: la respuesta arrancó con ". We can say that editing drafts is not within current
@@ -1777,6 +1805,11 @@ async function chatWithTools(url, apiKey, model, messages, onToolNotice, ctx) {
       if (looksLikeFakeCreatedTaskTitle(msg.content, actionedTitles)) {
         console.log(`[chatWithTools] ${providerLabel}/${model} ronda ${round + 1}/${MAX_ROUNDS}: respuesta bloqueada por firma de título de tarea inventado (no coincide con ninguna llamada real): ${JSON.stringify(msg.content?.slice(0, 200))}`);
         return 'No pude confirmar todos los ítems de forma segura. Pedímelo de nuevo mencionando uno por uno y debería funcionar.';
+      }
+      // Firma 5 (ítem 113): narrativa de vencimiento OAuth inventada (ver looksLikeFakeOAuthExpiryNarrative).
+      if (looksLikeFakeOAuthExpiryNarrative(msg.content)) {
+        console.log(`[chatWithTools] ${providerLabel}/${model} ronda ${round + 1}/${MAX_ROUNDS}: respuesta bloqueada por firma de vencimiento OAuth inventado (googleOAuthExpired=false): ${JSON.stringify(msg.content?.slice(0, 200))}`);
+        return 'Hubo un problema ejecutando esa acción, pero no fue un token vencido (el token está OK). Pedímelo de nuevo — si vuelve a fallar, avisame el error real en vez de que yo invente una causa.';
       }
       const cleanContent = stripLeakedReasoningPreamble(msg.content);
       if (cleanContent !== msg.content) {
@@ -2070,8 +2103,13 @@ function isValidModelForProvider(provider, model) {
 
 const PROVIDER_LABELS = { openrouter: 'OpenRouter' };
 
+// buildModelCatalogText() usa backticks Markdown a propósito (se reutiliza también en el system
+// prompt en texto plano, ahí no importa el formato) — acá, para el mensaje real de Telegram, se
+// convierten a <code> HTML (ítem 112). El texto de origen es 100% estático (ids/descripciones
+// hardcodeadas en MODELS_BY_PROVIDER, no hay input de usuario), así que no hace falta escapeHtml.
 function formatModelCatalog() {
-  return `⚠️ Esa combinación no es válida.\nProveedores y modelos disponibles:\n\n${buildModelCatalogText()}`;
+  const htmlCatalog = buildModelCatalogText().replace(/`([^`]+)`/g, '<code>$1</code>');
+  return `⚠️ Esa combinación no es válida.\nProveedores y modelos disponibles:\n\n${htmlCatalog}`;
 }
 
 // Texto plano del catálogo, reutilizado en el mensaje de error y en el system prompt (para que el modelo pueda recomendar el más adecuado según la tarea)
@@ -2202,8 +2240,8 @@ bot.start(async (ctx) => {
   await ctx.reply(
     `¡Hola Mariano! Soy OpenGravity 🚀\n\n` +
     `Configuración actual:\n` +
-    `• Provider: *${config.provider}*\n` +
-    `• Modelo: *${config.model}*\n\n` +
+    `• Provider: <b>${escapeHtml(config.provider)}</b>\n` +
+    `• Modelo: <b>${escapeHtml(config.model)}</b>\n\n` +
     `Comandos:\n` +
     `/config — ver configuración\n` +
     `/voz — cambiar voz (tomas/elena/alvaro/brian...)\n` +
@@ -2213,19 +2251,19 @@ bot.start(async (ctx) => {
     `/buscar [query] — buscar en la web\n` +
     `/clear — borrar historial\n\n` +
     `O decime en lenguaje natural:\n` +
-    `_"Cambiá al modelo gpt-oss-20b"_`,
-    { parse_mode: 'Markdown' }
+    `<i>"Cambiá al modelo gpt-oss-20b"</i>`,
+    { parse_mode: 'HTML' }
   );
 });
 
 bot.command('config', async (ctx) => {
   const config = await getConfig(ctx.from.id);
   await ctx.reply(
-    `⚙️ *Configuración actual:*\n\n` +
-    `• Provider: \`${config.provider}\`\n` +
-    `• Modelo: \`${config.model}\`\n\n` +
-    `Para cambiar decime:\n_"Cambiá a OpenRouter con nemotron"_`,
-    { parse_mode: 'Markdown' }
+    `⚙️ <b>Configuración actual:</b>\n\n` +
+    `• Provider: <code>${escapeHtml(config.provider)}</code>\n` +
+    `• Modelo: <code>${escapeHtml(config.model)}</code>\n\n` +
+    `Para cambiar decime:\n<i>"Cambiá a OpenRouter con nemotron"</i>`,
+    { parse_mode: 'HTML' }
   );
 });
 
@@ -2239,17 +2277,17 @@ bot.command('voz', async (ctx) => {
   const cfg = await getTTSConfig(ctx.from.id);
   const currentVoice = cfg.voice || DEFAULT_VOICE;
   if (!arg) {
-    const opciones = Object.entries(TTS_VOICES).map(([k, v]) => `\`${k}\` — ${v.label}`).join('\n');
+    const opciones = Object.entries(TTS_VOICES).map(([k, v]) => `<code>${escapeHtml(k)}</code> — ${escapeHtml(v.label)}`).join('\n');
     return ctx.reply(
-      `🎙️ *Configuración de voz actual:*\n• Voz: \`${currentVoice}\` — ${TTS_VOICES[currentVoice]?.label}\n\n` +
-      `*Voces disponibles:*\n${opciones}\n\n` +
-      `Uso: \`/voz tomas\` (hombre argentino) o \`/voz elena\` (mujer argentina)`,
-      { parse_mode: 'Markdown' }
+      `🎙️ <b>Configuración de voz actual:</b>\n• Voz: <code>${escapeHtml(currentVoice)}</code> — ${escapeHtml(TTS_VOICES[currentVoice]?.label)}\n\n` +
+      `<b>Voces disponibles:</b>\n${opciones}\n\n` +
+      `Uso: <code>/voz tomas</code> (hombre argentino) o <code>/voz elena</code> (mujer argentina)`,
+      { parse_mode: 'HTML' }
     );
   }
   if (!TTS_VOICES[arg]) return ctx.reply(`Voz no válida. Opciones: ${Object.keys(TTS_VOICES).join(', ')}`);
   await saveTTSConfig(ctx.from.id, { voice: arg });
-  await ctx.reply(`✅ Voz cambiada a \`${arg}\` — ${TTS_VOICES[arg].label}`, { parse_mode: 'Markdown' });
+  await ctx.reply(`✅ Voz cambiada a <code>${escapeHtml(arg)}</code> — ${escapeHtml(TTS_VOICES[arg].label)}`, { parse_mode: 'HTML' });
 });
 
 bot.command('velocidad', async (ctx) => {
@@ -2257,33 +2295,33 @@ bot.command('velocidad', async (ctx) => {
   const cfg = await getTTSConfig(ctx.from.id);
   if (isNaN(arg) || arg < 0.5 || arg > 2.0) {
     return ctx.reply(
-      `⚡ *Velocidad actual:* \`${cfg.speed || 1.0}x\`\n\nUsá un valor entre \`0.5\` y \`2.0\`\nEjemplo: \`/velocidad 1.2\``,
-      { parse_mode: 'Markdown' }
+      `⚡ <b>Velocidad actual:</b> <code>${cfg.speed || 1.0}x</code>\n\nUsá un valor entre <code>0.5</code> y <code>2.0</code>\nEjemplo: <code>/velocidad 1.2</code>`,
+      { parse_mode: 'HTML' }
     );
   }
   await saveTTSConfig(ctx.from.id, { speed: arg });
-  await ctx.reply(`✅ Velocidad cambiada a \`${arg}x\``, { parse_mode: 'Markdown' });
+  await ctx.reply(`✅ Velocidad cambiada a <code>${arg}x</code>`, { parse_mode: 'HTML' });
 });
 
 bot.command('idea', async (ctx) => {
   const text = ctx.message.text.replace('/idea', '').trim();
-  if (!text) return ctx.reply('Escribí la idea después del comando:\n`/idea [tu idea]`', { parse_mode: 'Markdown' });
+  if (!text) return ctx.reply('Escribí la idea después del comando:\n<code>/idea [tu idea]</code>', { parse_mode: 'HTML' });
   const id = await saveIdea(ctx.from.id, text);
-  await ctx.reply(`💡 Idea guardada (ID: ${id})\n\n"${text}"`);
+  await ctx.reply(`💡 Idea guardada (ID: ${escapeHtml(id)})\n\n"${escapeHtml(text)}"`, { parse_mode: 'HTML' });
 });
 
 bot.command('ideas', async (ctx) => {
   const ideas = await getIdeas(ctx.from.id);
   if (!ideas.length) return ctx.reply('No tenés ideas guardadas todavía.');
   const lista = ideas.slice(-10)
-    .map((i, idx) => `${idx + 1}. ${i.text}\n   📅 ${new Date(i.date).toLocaleDateString('es-AR')}`)
+    .map((i, idx) => `${idx + 1}. ${escapeHtml(i.text)}\n   📅 ${new Date(i.date).toLocaleDateString('es-AR')}`)
     .join('\n\n');
-  await ctx.reply(`💡 *Tus últimas ideas:*\n\n${lista}`, { parse_mode: 'Markdown' });
+  await ctx.reply(`💡 <b>Tus últimas ideas:</b>\n\n${lista}`, { parse_mode: 'HTML' });
 });
 
 bot.command('buscar', async (ctx) => {
   const query = ctx.message.text.replace('/buscar', '').trim();
-  if (!query) return ctx.reply('Escribí qué querés buscar:\n`/buscar [consulta]`', { parse_mode: 'Markdown' });
+  if (!query) return ctx.reply('Escribí qué querés buscar:\n<code>/buscar [consulta]</code>', { parse_mode: 'HTML' });
   await ctx.sendChatAction('typing');
   await ctx.reply(`🔍 Buscando: "${query}"...`);
   let results;
@@ -2344,7 +2382,7 @@ async function callAIWithTimeout(messages, config, onToolNotice, userId, ctx) {
       .then(async (lateResult) => {
         if (!lateResult || lateResult === GATED_NO_REPLY) return; // GATED_NO_REPLY: la UI de confirmación ya se mandó sola
         await saveMessage(userId, 'assistant', lateResult);
-        await ctx.reply(`⏱️ Esto se terminó de procesar después de avisarte que tardaba — el resultado real fue:\n\n${lateResult}`, { parse_mode: 'Markdown' });
+        await ctx.reply(`⏱️ Esto se terminó de procesar después de avisarte que tardaba — el resultado real fue:\n\n${escapeHtml(lateResult)}`, { parse_mode: 'HTML' });
       })
       .catch((error) => console.error('[callAIWithTimeout] error en trabajo tardío:', error.message));
     return 'Perdón, tardé demasiado en responder. Probá de nuevo o reformulá la pregunta.';
@@ -2352,12 +2390,16 @@ async function callAIWithTimeout(messages, config, onToolNotice, userId, ctx) {
   return result;
 }
 
+// `text` es siempre texto plano (respuesta libre de la IA o strings armados a mano, ninguno de los
+// dos confiable como HTML/Markdown ya formateado) — ítem 112: se escapa acá para el envío por
+// Telegram (parse_mode HTML, nunca se rompe con `_`/`<`/`>` sueltos) pero se lee en voz alta el
+// texto original sin escapar, para que el TTS no lea entidades HTML literales.
 async function replyWithAudio(ctx, text) {
   // Diagnóstico temporal (ver [[opengravity-bot-latencia]]): un mensaje que solo debía leer
   // Firestore (isConfigQuery, sin IA de por medio) tardó ~82s de punta a punta sin logs intermedios.
   // Instrumentado para ver si el cuello de botella es el envío del texto, el TTS o el envío de la nota de voz.
   console.log(`[replyWithAudio] antes de ctx.reply(texto): ${new Date().toISOString()}`);
-  await ctx.reply(text, { parse_mode: 'Markdown' }).catch(() => ctx.reply(text));
+  await ctx.reply(escapeHtml(text), { parse_mode: 'HTML' }).catch(() => ctx.reply(text));
   console.log(`[replyWithAudio] después de ctx.reply(texto), antes de TTS: ${new Date().toISOString()}`);
   const audioPath = await withTimeout(textToSpeech(text, ctx.from.id), TTS_TIMEOUT_MS);
   console.log(`[replyWithAudio] después de TTS (audioPath=${!!audioPath}): ${new Date().toISOString()}`);
@@ -2431,7 +2473,7 @@ async function handleUserText(ctx, text) {
   // ── Hora/fecha exacta — cálculo directo, sin inventar nada ──
   if (isTimeQuery(text)) {
     const datetime = getArgentinaDateTime();
-    const reply = `🕐 En Argentina son las: *${datetime}*`;
+    const reply = `🕐 En Argentina son las: ${datetime}`;
     await saveMessage(userId, 'user', text);
     await saveMessage(userId, 'assistant', reply);
     return replyWithAudio(ctx, reply);
@@ -2442,7 +2484,7 @@ async function handleUserText(ctx, text) {
     console.log(`[isConfigQuery] antes de getConfig: ${new Date().toISOString()}`);
     const config = await getConfig(userId);
     console.log(`[isConfigQuery] después de getConfig: ${new Date().toISOString()}`);
-    const reply = `⚙️ Estoy funcionando con:\n• Provider: *${config.provider}*\n• Modelo: *${config.model}*`;
+    const reply = `⚙️ Estoy funcionando con:\n• Provider: ${config.provider}\n• Modelo: ${config.model}`;
     await saveMessage(userId, 'user', text);
     await saveMessage(userId, 'assistant', reply);
     console.log(`[isConfigQuery] después de los 2 saveMessage, antes de replyWithAudio: ${new Date().toISOString()}`);
@@ -2459,8 +2501,8 @@ async function handleUserText(ctx, text) {
     };
     await saveTTSConfig(userId, newTts);
     const voiceLabel = TTS_VOICES[newTts.voice]?.label || newTts.voice;
-    const reply = `✅ Listo. Voz: ${voiceLabel} — Velocidad: ${newTts.speed}x`;
-    await ctx.reply(reply, { parse_mode: 'Markdown' });
+    const reply = `✅ Listo. Voz: ${escapeHtml(voiceLabel)} — Velocidad: ${newTts.speed}x`;
+    await ctx.reply(reply, { parse_mode: 'HTML' });
     const audioPath = await withTimeout(textToSpeech('Listo, así suena la voz ahora.', userId), TTS_TIMEOUT_MS);
     if (audioPath) {
       try { await ctx.replyWithVoice({ source: audioPath }); }
@@ -2481,7 +2523,7 @@ async function handleUserText(ctx, text) {
     // la config vieja como si el cambio hubiera aplicado — eso fue el bug real observado (pedir "modelo ZAI"
     // no matcheaba nada y el bot respondía "✅ actualizada" sin cambiar nada).
     if (text.toLowerCase().includes('modelo') && !model) {
-      return ctx.reply(formatModelCatalog(), { parse_mode: 'Markdown' });
+      return ctx.reply(formatModelCatalog(), { parse_mode: 'HTML' });
     }
 
     const current = await getConfig(userId);
@@ -2491,7 +2533,7 @@ async function handleUserText(ctx, text) {
     // Proveedor inexistente en el catálogo (ej. "groq", retirado) — rechazar explícito, sin
     // intentar leer un default que no existe.
     if (!MODELS_BY_PROVIDER[newProvider]) {
-      return ctx.reply(formatModelCatalog(), { parse_mode: 'Markdown' });
+      return ctx.reply(formatModelCatalog(), { parse_mode: 'HTML' });
     }
 
     if (!isValidModelForProvider(newProvider, newModel)) {
@@ -2499,15 +2541,15 @@ async function handleUserText(ctx, text) {
         // Cambio de proveedor sin modelo explícito: el modelo heredado no aplica, reseteamos al default (cambio válido implícito, no un error)
         newModel = MODELS_BY_PROVIDER[newProvider].default;
       } else {
-        return ctx.reply(formatModelCatalog(), { parse_mode: 'Markdown' });
+        return ctx.reply(formatModelCatalog(), { parse_mode: 'HTML' });
       }
     }
 
     const newConfig = { provider: newProvider, model: newModel };
     await saveConfig(userId, newConfig);
     return ctx.reply(
-      `✅ *Configuración actualizada:*\n\n• Provider: \`${newConfig.provider}\`\n• Modelo: \`${newConfig.model}\``,
-      { parse_mode: 'Markdown' }
+      `✅ <b>Configuración actualizada:</b>\n\n• Provider: <code>${escapeHtml(newConfig.provider)}</code>\n• Modelo: <code>${escapeHtml(newConfig.model)}</code>`,
+      { parse_mode: 'HTML' }
     );
   }
 
@@ -2574,7 +2616,7 @@ bot.on('voice', async (ctx) => {
     const transcribed = await transcribeAudio(fileUrl);
     console.log(`[voice] t3 después de transcribeAudio: ${new Date().toISOString()}`);
     if (!transcribed) return ctx.reply('❌ No pude entender el audio.');
-    await ctx.reply(`🎤 *Dijiste:* "${transcribed}"`, { parse_mode: 'Markdown' });
+    await ctx.reply(`🎤 <b>Dijiste:</b> "${escapeHtml(transcribed)}"`, { parse_mode: 'HTML' });
     console.log(`[voice] t4 antes de handleUserText: ${new Date().toISOString()}`);
     await handleUserText(ctx, transcribed);
     console.log(`[voice] t5 después de handleUserText: ${new Date().toISOString()}`);
@@ -2687,7 +2729,7 @@ async function buildDailyBrief(userId) {
   const logSnap = await db.collection('log_acciones').where('timestamp', '>=', desde).get();
   const acciones = logSnap.docs.map((d) => d.data());
   const resumenAcciones = acciones.length
-    ? acciones.map((a) => `• ${a.accion} → ${a.destinatario_o_archivo} (${a.resultado})`).join('\n')
+    ? acciones.map((a) => `• ${escapeHtml(a.accion)} → ${escapeHtml(a.destinatario_o_archivo)} (${escapeHtml(a.resultado)})`).join('\n')
     : 'Sin acciones registradas en las últimas 24hs.';
 
   const hermesSnap = await db.collection('tareas_hermes').where('estado', '==', 'pendiente').get();
@@ -2706,24 +2748,24 @@ async function buildDailyBrief(userId) {
       calendarClient.events.list({ calendarId: 'primary', timeMin: hoyInicio.toISOString(), timeMax: hoyFin.toISOString(), singleEvents: true, orderBy: 'startTime' })
     );
     calendarTexto = evResult.ok
-      ? (evResult.data.data.items.length ? evResult.data.data.items.map((e) => `• ${e.summary} (${e.start.dateTime || e.start.date})`).join('\n') : 'sin eventos hoy.')
-      : `error consultando Calendar: ${evResult.error}`;
+      ? (evResult.data.data.items.length ? evResult.data.data.items.map((e) => `• ${escapeHtml(e.summary)} (${escapeHtml(e.start.dateTime || e.start.date)})`).join('\n') : 'sin eventos hoy.')
+      : `error consultando Calendar: ${escapeHtml(evResult.error)}`;
   }
 
   const modelPings = await pingAllCatalogModels();
   const modelosFallando = modelPings.filter((m) => !m.ok);
   const modelosTexto = modelosFallando.length
-    ? `⚠️ Fallando: ${modelosFallando.map((m) => `${m.model} (${m.detail})`).join('; ')}`
+    ? `⚠️ Fallando: ${modelosFallando.map((m) => `${escapeHtml(m.model)} (${escapeHtml(m.detail)})`).join('; ')}`
     : 'todos los modelos del catálogo responden OK.';
 
   return (
-    `📋 *Aviso diario — ${getArgentinaDateTime()}*\n\n` +
-    `*Bot (ayer):*\n${resumenAcciones}\n\n` +
-    `*Hermes:*\n${hermesTexto}\n\n` +
-    `*Projects:*\nno disponible en H1 (requiere scope de Drive, fuera de alcance de este hito).\n\n` +
-    `*Calendar hoy:*\n${calendarTexto}\n\n` +
-    `*Token Gmail/Calendar/Tasks:* ${googleOAuthExpired ? '⚠️ vencido, pendiente de reautorización.' : 'OK.'}\n\n` +
-    `*Modelos (catálogo A3):* ${modelosTexto}`
+    `📋 <b>Aviso diario — ${escapeHtml(getArgentinaDateTime())}</b>\n\n` +
+    `<b>Bot (ayer):</b>\n${resumenAcciones}\n\n` +
+    `<b>Hermes:</b>\n${escapeHtml(hermesTexto)}\n\n` +
+    `<b>Projects:</b>\nno disponible en H1 (requiere scope de Drive, fuera de alcance de este hito).\n\n` +
+    `<b>Calendar hoy:</b>\n${calendarTexto}\n\n` +
+    `<b>Token Gmail/Calendar/Tasks:</b> ${googleOAuthExpired ? '⚠️ vencido, pendiente de reautorización.' : 'OK.'}\n\n` +
+    `<b>Modelos (catálogo A3):</b> ${modelosTexto}`
   );
 }
 
@@ -2771,7 +2813,7 @@ async function startBot() {
       (async () => {
         try {
           const brief = await buildDailyBrief(process.env.TELEGRAM_ALLOWED_USER_ID);
-          await bot.telegram.sendMessage(process.env.TELEGRAM_ALLOWED_USER_ID, brief, { parse_mode: 'Markdown' });
+          await bot.telegram.sendMessage(process.env.TELEGRAM_ALLOWED_USER_ID, brief, { parse_mode: 'HTML' });
         } catch (err) {
           console.error('Error generando/enviando el aviso diario:', err.message);
         }
