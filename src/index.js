@@ -1933,20 +1933,26 @@ async function chatWithTools(url, apiKey, model, messages, onToolNotice, ctx) {
   // el riesgo de duplicados del incidente del 31/07/2026 (ese fue por MÁS llamadas reales a
   // Google, no por generar texto de cierre). closingMs queda en el log para confirmar en vivo que
   // esta ronda extra no reintroduce el riesgo de pisar el timeout general de 40s (AI_TIMEOUT_MS).
-  console.log(`[chatWithTools] ${providerLabel}/${model}: se agotaron las ${MAX_ROUNDS} rondas de herramientas, pidiendo ronda de cierre (tool_choice:'none').`);
+  console.log(`[chatWithTools] ${providerLabel}/${model}: se agotaron las ${MAX_ROUNDS} rondas de herramientas, pidiendo ronda de cierre (sin tools).`);
   // Bug real visto en vivo (05/08/2026, revisión 00047-7qj): la ronda de cierre a veces vuelve con
-  // `content` vacío (27.6s, sin ningún error — gpt-oss a veces se come el budget en razonamiento
-  // oculto, mismo fenómeno documentado en el health check de arranque) y antes se rendía directo
-  // con el mensaje genérico, tirando a la basura los datos reales ya juntados en `convo`. Ahora
-  // reintenta UNA vez más antes de rendirse — mismo `tool_choice:'none'`, no agrega llamadas reales
-  // a Google, solo un segundo intento de redactar con los mismos datos.
+  // `content` vacío (27.6s, sin ningún error) o tarda mucho (41.8s) — mismo fenómeno documentado en
+  // el health check de arranque (gpt-oss a veces se come el budget en razonamiento oculto). Causa
+  // real identificada por código (no supuesta): esta ronda seguía mandando las 23 definiciones de
+  // TOOL_DEFS completas (~19KB / ~5000 tokens) con `tool_choice:'none'` — el modelo no puede
+  // llamarlas, pero igual las procesa en el contexto para "decidir" no usarlas, gastando presupuesto
+  // de razonamiento en peso muerto. Fix: la ronda de cierre ahora NO manda `tools` en absoluto (sin
+  // funciones disponibles, no hace falta `tool_choice` tampoco) — mismo efecto de "no puede volver a
+  // llamar herramientas" que antes, con un prompt bastante más liviano.
+  //
+  // Además, cuando vuelve vacía, reintenta UNA vez más antes de rendirse — no agrega llamadas reales
+  // a Google, solo un segundo intento de redactar con los mismos datos ya juntados en `convo`.
   const MAX_CLOSING_ATTEMPTS = 2;
   try {
     for (let attempt = 1; attempt <= MAX_CLOSING_ATTEMPTS; attempt++) {
       const closingStart = Date.now();
       const closingResponse = await axios.post(
         url,
-        { model, messages: convo, temperature: 0.5, tools: TOOL_DEFS, tool_choice: 'none' },
+        { model, messages: convo, temperature: 0.5 },
         { headers, timeout: 30000 }
       );
       const closingMs = Date.now() - closingStart;
