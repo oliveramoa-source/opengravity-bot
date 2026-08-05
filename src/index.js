@@ -660,22 +660,42 @@ async function tasksDelete(userId, taskId, tasklistId) {
 
 // Lista tareas por texto para resolver el taskId sin pedírselo a Mariano (mismo problema real
 // detectado 28/07/2026 en Calendar, agravado acá: no existía NINGUNA forma de listar tareas
-// existentes). Acepta tasklistId opcional (default: la lista por defecto, igual que antes) para
-// buscar en una lista puntual, y showCompleted opcional porque por default la API oculta
-// completadas — necesario para poder encontrar una tarea ya completada y descompletarla.
+// existentes). Acepta tasklistId opcional para buscar en una lista puntual, y showCompleted
+// opcional porque por default la API oculta completadas — necesario para poder encontrar una
+// tarea ya completada y descompletarla.
+//
+// Ítem 114 (05/08/2026): si NO se pasa tasklistId, antes buscaba solo en la lista por defecto —
+// si las tareas pedidas vivían en otra lista (visto en vivo: "pendientes San Francisco"), esa
+// ronda volvía vacía y el modelo necesitaba 2 rondas más (listar_listas_tareas + reintentar con
+// tasklistId puntual) para encontrarlas, agotando el presupuesto de MAX_ROUNDS antes de poder
+// responder (ver chatWithTools). Ahora, sin tasklistId, busca en TODAS las listas en una sola
+// llamada — cada item lleva su propio tasklistId para que marcar/editar/borrar sepan a qué lista
+// pertenece sin tener que volver a preguntar.
 async function tasksSearch(userId, { query, tasklistId, showCompleted }) {
-  const listId = tasklistId || await tasksGetDefaultListId(userId);
-  if (!listId) return { ok: false, expired: googleOAuthExpired };
-  const result = await callGoogleAPI(userId, () =>
-    tasksClient.tasks.list({ tasklist: listId, showCompleted: !!showCompleted, showHidden: !!showCompleted, maxResults: 50 })
-  );
-  if (!result.ok) return result;
-  let items = result.data.data.items || [];
-  if (query) {
-    const q = query.toLowerCase();
-    items = items.filter((t) => (t.title || '').toLowerCase().includes(q));
+  const q = query ? query.toLowerCase() : null;
+  if (tasklistId) {
+    const result = await callGoogleAPI(userId, () =>
+      tasksClient.tasks.list({ tasklist: tasklistId, showCompleted: !!showCompleted, showHidden: !!showCompleted, maxResults: 50 })
+    );
+    if (!result.ok) return result;
+    let items = (result.data.data.items || []).map((t) => ({ ...t, tasklistId }));
+    if (q) items = items.filter((t) => (t.title || '').toLowerCase().includes(q));
+    return { ok: true, data: { data: { items } } };
   }
-  return { ok: true, data: { data: { items, tasklistId: listId } } };
+  const listsResult = await tasksListLists(userId);
+  if (!listsResult.ok) return listsResult;
+  const lists = listsResult.data.data.items || [];
+  if (!lists.length) return { ok: true, data: { data: { items: [] } } };
+  const perList = await Promise.all(lists.map(async (l) => {
+    const result = await callGoogleAPI(userId, () =>
+      tasksClient.tasks.list({ tasklist: l.id, showCompleted: !!showCompleted, showHidden: !!showCompleted, maxResults: 50 })
+    );
+    if (!result.ok) return [];
+    let items = (result.data.data.items || []).map((t) => ({ ...t, tasklistId: l.id, tasklistTitle: l.title }));
+    if (q) items = items.filter((t) => (t.title || '').toLowerCase().includes(q));
+    return items;
+  }));
+  return { ok: true, data: { data: { items: perList.flat() } } };
 }
 
 // ─────────────────────────────────────────
@@ -1230,12 +1250,12 @@ const TOOL_DEFS = [
     type: 'function',
     function: {
       name: 'buscar_tareas',
-      description: 'Lista las tareas de Google Tasks (id, título), opcionalmente filtradas por texto del título. SIEMPRE llamá esta herramienta antes de marcar_tarea_completa, descompletar_tarea o borrar_tarea cuando no tengas ya el taskId de la conversación — NUNCA le pidas el ID a Mariano, él te dice el título/tema de la tarea y vos la buscás acá. Si hay una sola coincidencia, confirmá con él que es esa antes de actuar. Si hay varias, mostrale la lista para que elija. Por default solo trae tareas pendientes: para encontrar una tarea YA completada (ej. para descompletarla), llamá de nuevo con incluirCompletadas:true.',
+      description: 'Lista las tareas de Google Tasks (id, título), opcionalmente filtradas por texto del título. SIEMPRE llamá esta herramienta antes de marcar_tarea_completa, descompletar_tarea o borrar_tarea cuando no tengas ya el taskId de la conversación — NUNCA le pidas el ID a Mariano, él te dice el título/tema de la tarea y vos la buscás acá. Si hay una sola coincidencia, confirmá con él que es esa antes de actuar. Si hay varias, mostrale la lista para que elija. Por default solo trae tareas pendientes: para encontrar una tarea YA completada (ej. para descompletarla), llamá de nuevo con incluirCompletadas:true. Si NO pasás tasklistId, busca en TODAS las listas de una sola vez (no hace falta llamar primero a listar_listas_tareas para encontrar en qué lista está algo) — pasá tasklistId solo si ya sabés que Mariano se refiere a una lista puntual.',
       parameters: {
         type: 'object',
         properties: {
           query: { type: 'string', description: 'Texto a buscar en el título de la tarea. Vacío para listar todas.' },
-          tasklistId: { type: 'string', description: 'ID de la lista a buscar, opcional (default: la lista por defecto).' },
+          tasklistId: { type: 'string', description: 'ID de una lista puntual para acotar la búsqueda a esa lista sola, opcional (default: busca en todas las listas).' },
           incluirCompletadas: { type: 'boolean', description: 'true para incluir tareas ya completadas en el resultado (por default se ocultan).' },
         },
       },
@@ -1533,8 +1553,7 @@ const TOOL_HANDLERS = {
     if (!result.ok) return `Error buscando tareas: ${result.error}`;
     const items = result.data.data.items || [];
     if (!items.length) return 'No encontré tareas que coincidan con esa búsqueda.';
-    const listId = result.data.data.tasklistId;
-    return items.map((t) => `id: ${t.id}\ntasklistId: ${listId}\nTítulo: ${t.title}${t.status === 'completed' ? ' (completada)' : ''}${t.parent ? `\nSubtarea de: ${t.parent}` : ''}`).join('\n\n');
+    return items.map((t) => `id: ${t.id}\ntasklistId: ${t.tasklistId}${t.tasklistTitle ? ` (${t.tasklistTitle})` : ''}\nTítulo: ${t.title}${t.status === 'completed' ? ' (completada)' : ''}${t.parent ? `\nSubtarea de: ${t.parent}` : ''}`).join('\n\n');
   },
 
   marcar_tarea_completa: async ({ taskId, tasklistId }, ctx) => {
@@ -1845,8 +1864,56 @@ async function chatWithTools(url, apiKey, model, messages, onToolNotice, ctx) {
       return GATED_NO_REPLY; // sentinel, no null: null ya significa "timeout" en callAIWithTimeout
     }
   }
-  console.log(`[chatWithTools] ${providerLabel}/${model}: se quedó sin rondas. Último intento: ${lastToolNames.join(', ') || 'ninguno'}`);
-  return 'No pude completar la respuesta tras varias búsquedas. Probá reformular la pregunta.';
+
+  // Ítem 114 (05/08/2026): ronda de cierre reservada, FUERA del presupuesto de MAX_ROUNDS. Bug
+  // real: la ronda que solo redacta la respuesta final competía por el mismo cupo que las rondas
+  // de herramientas — un pedido legítimo que necesitara las 3 rondas de datos (ej. "listame mis
+  // tareas pendientes" buscando en varias listas, ver tasksSearch más arriba) se quedaba sin
+  // ninguna ronda para escribir la respuesta, aunque los datos ya estuvieran en convo. Esta ronda
+  // pide tool_choice:'none' — el modelo NO puede volver a llamar herramientas, así que no reabre
+  // el riesgo de duplicados del incidente del 31/07/2026 (ese fue por MÁS llamadas reales a
+  // Google, no por generar texto de cierre). closingMs queda en el log para confirmar en vivo que
+  // esta ronda extra no reintroduce el riesgo de pisar el timeout general de 40s (AI_TIMEOUT_MS).
+  console.log(`[chatWithTools] ${providerLabel}/${model}: se agotaron las ${MAX_ROUNDS} rondas de herramientas, pidiendo ronda de cierre (tool_choice:'none').`);
+  try {
+    const closingStart = Date.now();
+    const closingResponse = await axios.post(
+      url,
+      { model, messages: convo, temperature: 0.5, tools: TOOL_DEFS, tool_choice: 'none' },
+      { headers, timeout: 30000 }
+    );
+    const closingMs = Date.now() - closingStart;
+    const closingMsg = closingResponse.data.choices[0].message;
+    console.log(`[chatWithTools] ${providerLabel}/${model}: ronda de cierre tardó ${closingMs}ms.`);
+
+    // Mismas firmas anti-invención que arriba — una ronda sin tool_calls sigue siendo texto libre
+    // del modelo, así que puede colar la misma narrativa falsa que en una ronda normal.
+    if (looksLikeFakeActionConfirmation(closingMsg.content) || looksLikeFakeCompletedGatedAction(closingMsg.content)) {
+      console.log(`[chatWithTools] ${providerLabel}/${model}: cierre bloqueado por firma de confirmación/acción falsa: ${JSON.stringify(closingMsg.content?.slice(0, 200))}`);
+      return 'No pude armar esa acción de forma segura. Pedímelo de nuevo mencionando una sola acción concreta por vez (ej. "mové a la papelera el mail con id X", o "editá el evento con id Y") y debería funcionar.';
+    }
+    if (looksLikeFakeCompletedTasksAction(closingMsg.content, calledTools)) {
+      console.log(`[chatWithTools] ${providerLabel}/${model}: cierre bloqueado por firma de acción de Tasks inventada: ${JSON.stringify(closingMsg.content?.slice(0, 200))}`);
+      return 'No pude confirmar esa acción de Tasks de forma segura. Pedímelo de nuevo mencionando una sola acción concreta por vez y debería funcionar.';
+    }
+    if (looksLikeFakeCreatedTaskTitle(closingMsg.content, actionedTitles)) {
+      console.log(`[chatWithTools] ${providerLabel}/${model}: cierre bloqueado por firma de título de tarea inventado: ${JSON.stringify(closingMsg.content?.slice(0, 200))}`);
+      return 'No pude confirmar todos los ítems de forma segura. Pedímelo de nuevo mencionando uno por uno y debería funcionar.';
+    }
+    if (looksLikeFakeOAuthExpiryNarrative(closingMsg.content)) {
+      console.log(`[chatWithTools] ${providerLabel}/${model}: cierre bloqueado por firma de vencimiento OAuth inventado: ${JSON.stringify(closingMsg.content?.slice(0, 200))}`);
+      return 'Hubo un problema ejecutando esa acción, pero no fue un token vencido (el token está OK). Pedímelo de nuevo — si vuelve a fallar, avisame el error real en vez de que yo invente una causa.';
+    }
+    if (!closingMsg.content) {
+      console.log(`[chatWithTools] ${providerLabel}/${model}: ronda de cierre volvió sin contenido. Último intento: ${lastToolNames.join(', ') || 'ninguno'}`);
+      return 'No pude completar la respuesta tras varias búsquedas. Probá reformular la pregunta.';
+    }
+    return stripLeakedReasoningPreamble(closingMsg.content);
+  } catch (error) {
+    console.error(`[chatWithTools] ${providerLabel}/${model}: error en la ronda de cierre:`, error.response?.data || error.message);
+    console.log(`[chatWithTools] ${providerLabel}/${model}: se quedó sin rondas (incluida la de cierre). Último intento: ${lastToolNames.join(', ') || 'ninguno'}`);
+    return 'No pude completar la respuesta tras varias búsquedas. Probá reformular la pregunta.';
+  }
 }
 
 // Guarda en Firestore el detalle de qué proveedor/modelo falló y por qué, para diagnosticar sin adivinar
