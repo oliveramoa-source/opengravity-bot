@@ -116,15 +116,27 @@ if (process.env.GOOGLE_OAUTH_REFRESH_TOKEN) {
 // OAUTH_CALLBACK_PATH (la ruta es pública, no pasa por la allowlist de Telegram) con un `code`
 // cualquiera pueda pisar el refresh token guardado — solo se acepta el code si viene acompañado
 // del `state` que generamos nosotros al mandar el link, y solo una vez.
-let pendingOAuthState = null;
+//
+// Vive en Firestore, NO en memoria del proceso (bug real visto el 16/08/2026: con
+// autoscaling.knative.dev/maxScale=1 y minScale=0 por default, Cloud Run apaga la única
+// instancia por inactividad; el GET a OAUTH_CALLBACK_PATH que llega después cae en una
+// instancia nueva con memoria en blanco, y el link se rechazaba como "vencido o ya usado"
+// aunque el state en sí siguiera siendo válido). Guardar en Firestore hace que cualquier
+// instancia que atienda el callback pueda validarlo, sin importar cuál generó el link.
+const OAUTH_STATE_DOC = () => db.collection('oauth_state').doc('pending');
+const OAUTH_STATE_TTL_MS = 30 * 60 * 1000; // 30 min: ventana razonable para un link mandado por Telegram
 
-function buildReauthUrl() {
-  pendingOAuthState = { value: crypto.randomBytes(16).toString('hex'), expiresAt: Date.now() + 10 * 60 * 1000 };
+async function buildReauthUrl() {
+  const value = crypto.randomBytes(16).toString('hex');
+  const createdAt = Date.now();
+  // .set() (no merge) pisa cualquier state anterior sin usar — invalidación explícita, un solo
+  // link vigente a la vez, así no hay ambigüedad sobre cuál es el que sirve.
+  await OAUTH_STATE_DOC().set({ value, createdAt, expiresAt: createdAt + OAUTH_STATE_TTL_MS });
   return googleOAuthClient.generateAuthUrl({
     access_type: 'offline',
     prompt: 'consent',
     scope: GOOGLE_OAUTH_SCOPES,
-    state: pendingOAuthState.value,
+    state: value,
   });
 }
 
@@ -186,19 +198,31 @@ function isOAuthExpiryError(error) {
   return code === 'invalid_grant' || /invalid_grant/i.test(message);
 }
 
+// Arma y manda el link de reautorización por Telegram (HTML, blindado — ni el encabezado ni el
+// texto fijo llevan datos dinámicos que necesiten escapeHtml()). Compartido entre el aviso
+// automático de vencimiento y el pedido on-demand (ítem 3.1) — mismo mecanismo de Firestore,
+// mismo formato, para que no haya dos caminos distintos que puedan desalinearse.
+async function sendReauthLink(userId, { automatico }) {
+  const reauthUrl = await buildReauthUrl();
+  const minutos = Math.round(OAUTH_STATE_TTL_MS / 60000);
+  const encabezado = automatico
+    ? '⚠️ <b>El token de Gmail/Calendar/Tasks venció.</b>\n\nEs esperable (modo Testing, ciclo de 7 días) — no es un error del Bot.'
+    : '🔄 <b>Nuevo link de reautorización de Gmail/Calendar/Tasks.</b>\n\nInvalida cualquier link anterior que no hayas usado.';
+  await bot.telegram.sendMessage(
+    userId,
+    `${encabezado}\n\n` +
+    `Reautorizá acá (un clic, después el Bot vuelve a andar normal):\n<a href="${reauthUrl}">Reautorizar</a>\n\n` +
+    `Vale por ${minutos} minutos.`,
+    { parse_mode: 'HTML' }
+  );
+}
+
 // Detección + aviso proactivo (ítem 88): nunca falla en silencio, nunca reintenta ni simula éxito.
 async function handleOAuthExpiry(userId, error) {
   googleOAuthExpired = true;
-  const reauthUrl = buildReauthUrl();
   const detail = error.response?.data?.error_description || error.message;
   try {
-    await bot.telegram.sendMessage(
-      userId,
-      `⚠️ <b>El token de Gmail/Calendar/Tasks venció.</b>\n\n` +
-      `Es esperable (modo Testing, ciclo de 7 días) — no es un error del Bot.\n\n` +
-      `Reautorizá acá (un clic, después el Bot vuelve a andar normal):\n<a href="${reauthUrl}">Reautorizar</a>`,
-      { parse_mode: 'HTML' }
-    );
+    await sendReauthLink(userId, { automatico: true });
   } catch (sendError) {
     console.error('Error avisando vencimiento de OAuth por Telegram:', sendError.message);
   }
@@ -1331,6 +1355,18 @@ const TOOL_DEFS = [
   {
     type: 'function',
     function: {
+      name: 'regenerar_link_reautorizacion',
+      description:
+        'Genera y manda por Telegram un link nuevo para reautorizar el acceso de Google (Gmail/Calendar/Tasks), invalidando cualquier link anterior sin usar. ' +
+        'Usala cuando Mariano lo pida en lenguaje natural — variantes tipo "dame un link nuevo para reautorizar", "el link venció, mandame otro", "necesito reautorizar Gmail", "quiero renovar el acceso de Google" — ' +
+        'sin importar si el token está realmente vencido en este momento: el pedido explícito de Mariano ya es motivo suficiente (puede ser preventivo, o porque el estado quedó inconsistente). ' +
+        'NUNCA respondas que el proceso "es automático" o que "no se puede generar manualmente" — para eso existe esta herramienta, siempre llamala ante este tipo de pedido en vez de explicarle a Mariano por qué no se puede.',
+      parameters: { type: 'object', properties: {} },
+    },
+  },
+  {
+    type: 'function',
+    function: {
       name: 'derivar_tarea_project',
       description: 'Deriva un pedido al carril de un Project específico (Dr. Civil, Bróker, etc.) cuando necesita el contexto o los archivos de ese Project — ej. un dictamen jurídico, una propuesta de negocio.',
       parameters: {
@@ -1613,6 +1649,18 @@ const TOOL_HANDLERS = {
     const ref = await db.collection('tareas_hermes').add(doc);
     await logAccion({ accion: 'derivar_tarea_hermes', destinatario_o_archivo: ref.id, confirmada: true, resultado: `creada: ${titulo}` });
     return `Tarea derivada a Hermes (id ${ref.id}): "${titulo}".`;
+  },
+
+  regenerar_link_reautorizacion: async (_args, ctx) => {
+    const userId = ctx?.chat?.id || process.env.TELEGRAM_ALLOWED_USER_ID;
+    await sendReauthLink(userId, { automatico: false });
+    await logAccion({
+      accion: 'oauth_reautorizacion_pedida_on_demand',
+      destinatario_o_archivo: 'google-oauth-refresh-token',
+      confirmada: true,
+      resultado: 'link nuevo generado y enviado a pedido explícito',
+    });
+    return 'Listo, ya mandé el link de reautorización nuevo por Telegram (invalidó cualquier link anterior sin usar). No hace falta que se lo repitas en tu respuesta, el link ya fue enviado como mensaje aparte.';
   },
 };
 
@@ -2984,26 +3032,37 @@ async function startBot() {
       return;
     }
     if (req.method === 'GET' && req.url.startsWith(OAUTH_CALLBACK_PATH)) {
-      const params = new URL(req.url, OAUTH_REDIRECT_URI || 'http://localhost').searchParams;
-      const code = params.get('code');
-      const errorParam = params.get('error');
-      const state = params.get('state');
-      res.writeHead(200, { 'Content-Type': 'text/html; charset=utf-8' });
-      if (errorParam) {
-        res.end('<h2>Autorización cancelada o denegada. Podés cerrar esta pestaña.</h2>');
-        return;
-      }
-      if (!pendingOAuthState || state !== pendingOAuthState.value || Date.now() > pendingOAuthState.expiresAt) {
-        res.end('<h2>Este link de reautorización venció o ya se usó. Pedile uno nuevo al Bot.</h2>');
-        return;
-      }
-      if (!code) {
-        res.end('<h2>Falta el parámetro code en la respuesta de Google.</h2>');
-        return;
-      }
-      pendingOAuthState = null;
-      res.end('<h2>✅ Reautorización recibida, procesando... Ya podés cerrar esta pestaña, el Bot te avisa por Telegram.</h2>');
-      completeOAuthCallback(code);
+      // Async por la lectura a Firestore — mismo patrón que el handler de /cron/daily-brief más
+      // arriba (IIFE en background), el listener de http.createServer no puede ser async directo.
+      (async () => {
+        const params = new URL(req.url, OAUTH_REDIRECT_URI || 'http://localhost').searchParams;
+        const code = params.get('code');
+        const errorParam = params.get('error');
+        const state = params.get('state');
+        res.writeHead(200, { 'Content-Type': 'text/html; charset=utf-8' });
+        if (errorParam) {
+          res.end('<h2>Autorización cancelada o denegada. Podés cerrar esta pestaña.</h2>');
+          return;
+        }
+        let pending = null;
+        try {
+          const snap = await OAUTH_STATE_DOC().get();
+          pending = snap.exists ? snap.data() : null;
+        } catch (err) {
+          console.error('Error leyendo el estado de reautorización en Firestore:', err.message);
+        }
+        if (!pending || state !== pending.value || Date.now() > pending.expiresAt) {
+          res.end('<h2>Este link de reautorización venció o ya se usó. Pedile uno nuevo al Bot.</h2>');
+          return;
+        }
+        if (!code) {
+          res.end('<h2>Falta el parámetro code en la respuesta de Google.</h2>');
+          return;
+        }
+        await OAUTH_STATE_DOC().delete();
+        res.end('<h2>✅ Reautorización recibida, procesando... Ya podés cerrar esta pestaña, el Bot te avisa por Telegram.</h2>');
+        completeOAuthCallback(code);
+      })();
       return;
     }
     res.writeHead(404);
