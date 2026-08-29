@@ -89,11 +89,20 @@ bot.use(async (ctx, next) => {
 // restringido gmail.modify. Consecuencia aceptada: el refresh token vence cada 7 días; ver
 // handleOAuthExpiry() más abajo para la detección + aviso proactivo)
 // ─────────────────────────────────────────
+// ítem 146 (29/08/2026): se agrega drive.readonly, no drive/drive.file. Mínimo privilegio real:
+// hoy no hay ningún código que escriba en Drive (derivar_tarea_project sigue sin implementar la
+// escritura), y lo único planificado para el corto plazo es que el carril "Projects" pueda LEER
+// archivos de contexto de cada Project — si el día de mañana hace falta escribir/compartir (H2/H3
+// según el .md base), ese es motivo para pedir drive.file en una sesión aparte, no para adelantarlo
+// ahora sin un uso real detrás. Proyecto en modo "Testing" con un solo usuario (Mariano): agregar
+// un scope de solo lectura no dispara verificación de Google ni tiene costo, pero sí exige que
+// Mariano vuelva a pasar por la pantalla de consentimiento la próxima vez que use el bot.
 const GOOGLE_OAUTH_SCOPES = [
   'https://www.googleapis.com/auth/gmail.send',
   'https://www.googleapis.com/auth/gmail.modify',
   'https://www.googleapis.com/auth/calendar.events',
   'https://www.googleapis.com/auth/tasks',
+  'https://www.googleapis.com/auth/drive.readonly',
 ];
 
 // Ruta pública que recibe el redirect de Google al completar el consent screen (ítem 97 fix): sin
@@ -1379,6 +1388,60 @@ const TOOL_DEFS = [
   {
     type: 'function',
     function: {
+      name: 'agregar_regla_bot',
+      description:
+        'Guarda una regla personal nueva que Mariano pide en lenguaje natural (ej. "agregame esta regla: nunca me sugieras reuniones después de las 20hs") para que se respete en TODAS las conversaciones futuras, no solo en esta. ' +
+        'Inferí vos la categoría más razonable según el contenido de la regla si Mariano no la especifica explícitamente. Después de llamar esta herramienta, confirmale a Mariano qué quedó guardado y en qué categoría, para que pueda corregirte si interpretaste mal.',
+      parameters: {
+        type: 'object',
+        properties: {
+          texto: { type: 'string', description: 'La regla tal cual la dijo Mariano (o una versión levemente prolijada, sin cambiar el sentido).' },
+          categoria: {
+            type: 'string',
+            enum: ['estilo', 'comportamiento', 'dato_fijo'],
+            description: '"estilo" = cómo hablás/formateás (ej. tono, longitud). "comportamiento" = qué hacés o evitás hacer (ej. horarios, confirmaciones). "dato_fijo" = un dato que hay que recordar siempre (ej. una dirección, una preferencia fija).',
+          },
+        },
+        required: ['texto', 'categoria'],
+      },
+    },
+  },
+  {
+    type: 'function',
+    function: {
+      name: 'listar_reglas_bot',
+      description: 'Devuelve todas las reglas personales activas de Mariano, agrupadas por categoría, para que las pueda auditar por Telegram sin tocar Firestore a mano. Usala cuando pregunte algo como "¿qué reglas tengo guardadas?" o "listame mis reglas".',
+      parameters: { type: 'object', properties: {} },
+    },
+  },
+  {
+    type: 'function',
+    function: {
+      name: 'desactivar_regla_bot',
+      description:
+        'Desactiva una regla personal (no la borra, queda en Firestore con activa:false). Recibe el id exacto de la regla (si ya lo tenés de una llamada anterior a esta misma herramienta o a listar_reglas_bot) o una descripción/fragmento de texto en lenguaje natural. ' +
+        'Si pasás una descripción y hay una sola coincidencia entre las reglas activas, la herramienta te la va a mostrar para que se la confirmes a Mariano ANTES de desactivarla — recién cuando confirme, volvé a llamar esta misma herramienta con el id exacto que te devolvió. ' +
+        'Si hay varias coincidencias, te va a mostrar la lista para que Mariano elija cuál — mismo criterio que ya usás para editar/borrar eventos de Calendar o tareas de Tasks: nunca le pidas un id interno a él, buscalo y confirmalo vos.',
+      parameters: {
+        type: 'object',
+        properties: {
+          id_o_descripcion: { type: 'string', description: 'El id exacto de la regla (de una respuesta anterior), o una descripción/fragmento del texto de la regla que Mariano quiere desactivar.' },
+        },
+        required: ['id_o_descripcion'],
+      },
+    },
+  },
+  {
+    type: 'function',
+    function: {
+      name: 'estado_cadena_modelos',
+      description: 'Chequea en vivo (ping real contra OpenRouter, reusa el mismo mecanismo del job de las 9hs) el estado de los 4 modelos de la cadena de fallback y devuelve un checklist OK/caído de cada uno, más cuál es el modelo activo ahora mismo según el orden real de fallback. Usala cuando Mariano pregunte algo como "¿cómo están los modelos?", "estado de la cadena", "¿algún modelo está caído?" — es diagnóstico, no sirve para cambiar de modelo (eso es /config).',
+      parameters: { type: 'object', properties: {} },
+    },
+  },
+  {
+    type: 'function',
+    function: {
       name: 'derivar_tarea_project',
       description: 'Deriva un pedido al carril de un Project específico (Dr. Civil, Bróker, etc.) cuando necesita el contexto o los archivos de ese Project — ej. un dictamen jurídico, una propuesta de negocio.',
       parameters: {
@@ -1630,12 +1693,83 @@ const TOOL_HANDLERS = {
     return 'Le mostré la confirmación a Mariano — no se borró todavía.';
   },
 
-  // El carril "Project" (buzón Drive por carpeta) necesita el scope de Drive, que NO está entre
-  // los 4 scopes mínimos autorizados en Paso 1 de H1 (gmail.send, gmail.modify, calendar.events,
-  // tasks) — agregarlo implica repetir todo el consent screen. Se deja el tool para que el modelo
-  // pueda reconocer el pedido y avisar la limitación real en vez de fingir que lo hizo (Lección Gordon).
+  // ítem 151 (29/08/2026) — reglas personales persistentes, colección Firestore `bot_rules`.
+  agregar_regla_bot: async ({ texto, categoria }) => {
+    const categoriaValida = ['estilo', 'comportamiento', 'dato_fijo'].includes(categoria) ? categoria : 'comportamiento';
+    const doc = { texto, categoria: categoriaValida, fecha_creacion: new Date().toISOString(), activa: true };
+    const ref = await db.collection('bot_rules').add(doc);
+    await logAccion({ accion: 'agregar_regla_bot', destinatario_o_archivo: ref.id, confirmada: true, resultado: `regla creada (${categoriaValida}): "${texto}"` });
+    return `Regla guardada en la categoría "${categoriaValida}": "${texto}" (id ${ref.id}). Va a aplicar desde el próximo mensaje. Confirmale a Mariano qué quedó guardado y en qué categoría, para que te corrija si hizo falta otra.`;
+  },
+
+  listar_reglas_bot: async () => {
+    const snap = await db.collection('bot_rules').where('activa', '==', true).get();
+    if (snap.empty) return 'No hay ninguna regla personal activa guardada todavía.';
+    const porCategoria = {};
+    snap.forEach((doc) => {
+      const d = doc.data();
+      (porCategoria[d.categoria] ||= []).push(`- [id: ${doc.id}] ${d.texto}`);
+    });
+    return Object.entries(porCategoria)
+      .map(([categoria, items]) => `[${categoria}]\n${items.join('\n')}`)
+      .join('\n\n');
+  },
+
+  desactivar_regla_bot: async ({ id_o_descripcion }) => {
+    const snap = await db.collection('bot_rules').where('activa', '==', true).get();
+    if (snap.empty) return 'No hay ninguna regla activa para desactivar.';
+
+    const idBuscado = (id_o_descripcion || '').trim();
+    const porId = snap.docs.find((d) => d.id === idBuscado);
+    if (porId) {
+      await porId.ref.set({ activa: false }, { merge: true });
+      await logAccion({ accion: 'desactivar_regla_bot', destinatario_o_archivo: porId.id, confirmada: true, resultado: `desactivada: "${porId.data().texto}"` });
+      return `Regla desactivada: "${porId.data().texto}". Sigue guardada en Firestore con activa:false, no se borró.`;
+    }
+
+    const q = idBuscado.toLowerCase();
+    const matches = snap.docs.filter((d) => {
+      const t = d.data().texto.toLowerCase();
+      return t.includes(q) || q.includes(t);
+    });
+    if (!matches.length) {
+      return `No encontré ninguna regla activa que coincida con "${id_o_descripcion}". Llamá a listar_reglas_bot para ver el texto exacto de las reglas activas y volvé a intentar.`;
+    }
+    if (matches.length > 1) {
+      return `Encontré varias reglas activas que podrían coincidir — mostrale esta lista a Mariano para que elija cuál, y volvé a llamar esta misma herramienta con el id exacto de la que confirme:\n${matches.map((d) => `- id: ${d.id} — "${d.data().texto}"`).join('\n')}`;
+    }
+    const [match] = matches;
+    return `Encontré esta regla activa que coincide: id: ${match.id} — "${match.data().texto}". Confirmale a Mariano que es esta antes de desactivarla — volvé a llamar esta misma herramienta con ese id exacto una vez que confirme.`;
+  },
+
+  // ítem 152 (29/08/2026) — reusa pingAllCatalogModels() ya existente (job de las 9hs), no
+  // duplica la lógica de ping. "Modelo activo ahora" replica el mismo orden real de callAI():
+  // primero el modelo configurado (config.model, lo que se intenta primero de verdad), después
+  // la cadena fija de fallback tal cual está hardcodeada ahí — no es un dato que pingAllCatalogModels()
+  // devuelva por sí solo, se infiere cruzando ambas cosas.
+  estado_cadena_modelos: async (_args, ctx) => {
+    const config = await getConfig(ctx.from.id);
+    const pings = await pingAllCatalogModels();
+    const byModel = Object.fromEntries(pings.map((p) => [p.model, p]));
+    const ordenFallback = [
+      config?.model || MODELS_BY_PROVIDER.openrouter.default,
+      'nvidia/nemotron-3-ultra-550b-a55b:free',
+      'minimax/minimax-m3:free',
+      'openrouter/free',
+    ];
+    const cadenaSinRepetir = [...new Set(ordenFallback)];
+    const activo = cadenaSinRepetir.find((m) => byModel[m]?.ok);
+    const lineas = pings.map((p, i) => `${i + 1}. ${p.model} — ${p.ok ? '✅ OK' : `❌ caído${p.detail ? `: ${p.detail}` : ''}`}`);
+    return `Estado de la cadena de modelos:\n${lineas.join('\n')}\nModelo activo ahora: ${activo || 'ninguno — los 4 modelos están caídos en este momento.'}`;
+  },
+
+  // El carril "Project" (buzón Drive por carpeta) tiene desde el ítem 146 (29/08/2026) el scope
+  // drive.readonly autorizado (GOOGLE_OAUTH_SCOPES), pero eso solo es el permiso — todavía no hay
+  // ningún cliente de Drive API ni lógica de lectura/escritura de archivos conectada en este código
+  // (eso sigue siendo H2/H3 según el .md base). Se deja el tool para que el modelo reconozca el
+  // pedido y avise la limitación real en vez de fingir que lo hizo (Lección Gordon).
   derivar_tarea_project: async ({ proyecto, titulo }) => {
-    return `No puedo derivar todavía al carril de Project ("${proyecto}: ${titulo}") — escribir en el buzón de Drive de los Projects necesita un scope de Google Drive que no está autorizado en este hito (H1 solo pidió Gmail/Calendar/Tasks). Es una limitación real, no un error: hay que agregar el scope y repetir el consent screen si se quiere habilitar esto.`;
+    return `No puedo derivar todavía al carril de Project ("${proyecto}: ${titulo}") — el scope de Google Drive ya está autorizado, pero la integración real (leer/escribir en el buzón de Drive de los Projects) todavía no está implementada en el código, queda para un hito posterior (H2/H3). Es una limitación real, no un error.`;
   },
 
   derivar_tarea_hermes: async ({ titulo, instruccion, contexto, criterio_exito, entregable_tipo, entregable_destino, proyecto, prioridad }) => {
@@ -2408,14 +2542,38 @@ REGLA OPERATIVA DURA — marcar/descompletar/borrar tareas de Tasks, o borrar un
 
 REGLA OPERATIVA DURA — no confundir redactar_enviar_mail con mover_mail_papelera (bug real visto en vivo 29/07/2026): son operaciones OPUESTAS y no relacionadas — redactar_enviar_mail crea y manda un mail NUEVO que Mariano está dictando/escribiendo ahora; mover_mail_papelera borra un mail YA EXISTENTE en la bandeja de entrada. Si Mariano te pide "enviá un mail", "mandale un mail a X", o te dicta destinatario/asunto/cuerpo, es SIEMPRE redactar_enviar_mail — nunca mover_mail_papelera, aunque la dirección de destino te llegue con formato raro (típico de audio transcripto, ej. "nombre.com" en vez de "nombre@gmail.com"). Si la dirección no tiene forma de email válida, la herramienta te va a avisar — en ese caso preguntale a Mariano la dirección exacta en vez de inventar una acción distinta.`;
 
+// ítem 151 (29/08/2026): lee de Firestore (`bot_rules`) solo las reglas con activa:true, las
+// agrupa por categoría y arma el bloque a inyectar en el system prompt. Se recalcula en cada
+// turno (mismo motivo que la fecha/hora de abajo) para que una regla nueva quede activa desde el
+// mensaje siguiente sin reiniciar nada. Si no hay ninguna regla activa, devuelve '' — el header no
+// se manda vacío nunca.
+async function buildUserRulesBlock() {
+  const snap = await db.collection('bot_rules').where('activa', '==', true).get();
+  if (snap.empty) return '';
+  const porCategoria = {};
+  snap.forEach((doc) => {
+    const d = doc.data();
+    (porCategoria[d.categoria] ||= []).push(d.texto);
+  });
+  const lineas = Object.entries(porCategoria)
+    .filter(([, items]) => items.length)
+    .map(([categoria, items]) => items.map((t) => `[${categoria}] ${t}`).join('\n'))
+    .join('\n');
+  if (!lineas) return '';
+  return `REGLAS PERSONALES DE MARIANO (agregadas por él mismo — respetalas\nsiempre, salvo que entren en conflicto directo con una REGLA\nOPERATIVA DURA de arriba, en cuyo caso la dura gana):\n${lineas}`;
+}
+
 // Se recalcula en cada turno (no es una constante fija) porque el contenedor de Cloud Run puede
 // quedar levantado horas o reiniciarse a mitad de la noche — si la fecha/hora quedara fija al
 // arrancar el proceso, el modelo calculaba mal "hoy"/"mañana" (bug real detectado 28/07/2026:
 // pedido a la noche del 27/07 para "mañana" resultó en un evento creado el 29/07 en vez del 28/07).
-function buildSystemPromptFull() {
+// ítem 151: ahora es async porque también lee las reglas personales activas de Firestore en cada
+// turno — todos los call sites deben usar `await buildSystemPromptFull()`.
+async function buildSystemPromptFull() {
+  const reglasBlock = await buildUserRulesBlock();
   return `${SYSTEM_PROMPT_STATIC}
 
-FECHA Y HORA ACTUAL EN ARGENTINA (usá esto como referencia exacta para calcular "hoy", "mañana", "el lunes que viene", etc. — nunca la infieras de otra forma): ${getArgentinaDateTime()}.`;
+FECHA Y HORA ACTUAL EN ARGENTINA (usá esto como referencia exacta para calcular "hoy", "mañana", "el lunes que viene", etc. — nunca la infieras de otra forma): ${getArgentinaDateTime()}.${reglasBlock ? `\n\n${reglasBlock}` : ''}`;
 }
 
 // ─────────────────────────────────────────
@@ -2597,7 +2755,7 @@ bot.command('buscar', async (ctx) => {
   const config = await getConfig(ctx.from.id);
   const history = await getHistory(ctx.from.id);
   const messages = [
-    { role: 'system', content: buildSystemPromptFull() },
+    { role: 'system', content: await buildSystemPromptFull() },
     ...history,
     { role: 'user', content: `${query}\n\nResultados web:\n${results}` },
   ];
@@ -2712,7 +2870,7 @@ async function handleUserText(ctx, text) {
     await saveMessage(userId, 'user', text);
     const revisionPrompt = `Mariano pidió un cambio sobre el borrador pendiente que le mostraste (${pending.kind}):\n${pending.preview}\n\nCambio pedido: "${text}"\n\nVolvé a armar la acción completa con este cambio aplicado y llamá otra vez a la herramienta correspondiente con el borrador corregido — no le vuelvas a preguntar datos que ya tenías antes de este cambio.`;
     const revisionMessages = [
-      { role: 'system', content: buildSystemPromptFull() },
+      { role: 'system', content: await buildSystemPromptFull() },
       ...history,
       { role: 'user', content: revisionPrompt },
     ];
@@ -2828,7 +2986,7 @@ async function handleUserText(ctx, text) {
 
   await saveMessage(userId, 'user', text);
   const messages = [
-    { role: 'system', content: buildSystemPromptFull() },
+    { role: 'system', content: await buildSystemPromptFull() },
     ...history,
     { role: 'user', content: text },
   ];
@@ -2926,7 +3084,7 @@ bot.on('document', async (ctx) => {
     const history = await getHistory(userId);
     const userPrompt = `Resumí los puntos clave de este documento ("${fileName}"):\n\n${text.slice(0, 8000)}`;
     const messages = [
-      { role: 'system', content: buildSystemPromptFull() },
+      { role: 'system', content: await buildSystemPromptFull() },
       ...history,
       { role: 'user', content: userPrompt },
     ];
@@ -3024,7 +3182,7 @@ async function buildDailyBrief(userId) {
     `📋 <b>Aviso diario — ${escapeHtml(getArgentinaDateTime())}</b>\n\n` +
     `<b>Bot (ayer):</b>\n${resumenAcciones}\n\n` +
     `<b>Hermes:</b>\n${escapeHtml(hermesTexto)}\n\n` +
-    `<b>Projects:</b>\nno disponible en H1 (requiere scope de Drive, fuera de alcance de este hito).\n\n` +
+    `<b>Projects:</b>\nno disponible todavía (scope de Drive ya autorizado desde el ítem 146, pero la integración de lectura/escritura sigue sin implementar — H2/H3).\n\n` +
     `<b>Calendar hoy:</b>\n${calendarTexto}\n\n` +
     `<b>Token Gmail/Calendar/Tasks:</b> ${googleOAuthExpired ? '⚠️ vencido, pendiente de reautorización.' : 'OK.'}\n\n` +
     `<b>Modelos (catálogo A3):</b> ${modelosTexto}`
