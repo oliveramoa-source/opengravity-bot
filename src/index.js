@@ -260,7 +260,7 @@ async function callGoogleAPI(userId, fn) {
 async function getConfig(userId) {
   const doc = await db.collection('config').doc(String(userId)).get();
   if (!doc.exists) {
-    return { provider: 'openrouter', model: 'openai/gpt-oss-120b' };
+    return { provider: 'openrouter', model: 'z-ai/glm-5.2:free' };
   }
   return doc.data();
 }
@@ -924,6 +924,18 @@ function getArgentinaDateTime() {
     hour: '2-digit', minute: '2-digit', second: '2-digit', hour12: false,
   });
   return formatter.format(now);
+}
+
+// Ventana "hoy" (00:00–23:59:59) en hora Argentina, independiente de la TZ del contenedor
+// (Cloud Run no tiene TZ seteada — corre en UTC). Argentina usa UTC-3 fijo, sin horario de
+// verano, desde 2009, así que el offset -03:00 es seguro de hardcodear. Usado por
+// buildDailyBrief() para no mostrar eventos de ayer/mañana según la hora del día en que corre el cron.
+function getArgentinaTodayBounds() {
+  const hoy = new Intl.DateTimeFormat('en-CA', { timeZone: 'America/Argentina/Buenos_Aires' }).format(new Date());
+  return {
+    inicio: new Date(`${hoy}T00:00:00-03:00`),
+    fin: new Date(`${hoy}T23:59:59-03:00`),
+  };
 }
 
 // ─────────────────────────────────────────
@@ -2067,6 +2079,50 @@ function classifyAIError(error) {
   return 'error_desconocido';
 }
 
+// Clasifica el motivo de un cambio de modelo (fallback) para el texto de la alerta de Telegram —
+// taxonomía propia, distinta de classifyAIError() (esa alimenta ai_errors con otras categorías).
+function classifyFallbackAlertReason(error, detail) {
+  const status = error.response?.status;
+  const message = `${detail || ''} ${error.response?.data?.error?.message || error.message || ''}`.toLowerCase();
+  if (status === 429 || /requires more credits|rate.?limit/.test(message)) return 'credito_agotado';
+  if ((status && status >= 500) || /provider returned error|timeout|timed out|bad gateway|service unavailable/.test(message)) return 'proveedor_fallando';
+  return 'otro';
+}
+
+const MODEL_FALLBACK_ALERT_COOLDOWN_MS = 30 * 60 * 1000;
+
+// Antispam en Firestore, no en memoria: mismo motivo que pendingOAuthState (ver sesión del
+// 16/08/2026) — Cloud Run puede reiniciar la instancia entre dos fallbacks reales (maxScale=1,
+// sin minScale, escala a cero por inactividad), y un contador en memoria perdería la cuenta del
+// último aviso en cada arranque nuevo, mandando alertas de más. Máximo 1 alerta cada 30 min por
+// par modelo-viejo→modelo-nuevo. Best-effort: un fallo acá nunca debe romper la respuesta normal
+// al usuario, solo logueado.
+async function notifyModelFallback(modeloViejo, modeloNuevo, error, detail) {
+  try {
+    const docId = `${modeloViejo}__${modeloNuevo}`.replace(/[^a-zA-Z0-9_.-]/g, '_');
+    const ref = db.collection('model_fallback_alerts').doc(docId);
+    const snap = await ref.get();
+    const now = Date.now();
+    const last = snap.exists ? snap.data().timestamp : 0;
+    if (now - last < MODEL_FALLBACK_ALERT_COOLDOWN_MS) return;
+
+    const reason = classifyFallbackAlertReason(error, detail);
+    let texto;
+    if (reason === 'credito_agotado') {
+      texto = `⚠️ Cambio de modelo a ${modeloNuevo} — ${modeloViejo} se quedó sin crédito/cupo disponible.`;
+    } else if (reason === 'proveedor_fallando') {
+      texto = `⚠️ Cambio de modelo a ${modeloNuevo} — ${modeloViejo} está fallando (error del proveedor).`;
+    } else {
+      texto = `⚠️ Cambio de modelo a ${modeloNuevo} — ${modeloViejo} falló: ${escapeHtml(detail || 'motivo no clasificable')}.`;
+    }
+
+    await ref.set({ timestamp: now }, { merge: true });
+    await bot.telegram.sendMessage(process.env.TELEGRAM_ALLOWED_USER_ID, texto, { parse_mode: 'HTML' });
+  } catch (err) {
+    console.error('Error mandando alerta de cambio de modelo (best-effort, no rompe la respuesta):', err.message);
+  }
+}
+
 async function callAI(messages, config, onToolNotice, userId, ctx) {
   const headers = { 'Content-Type': 'application/json' };
   // Groq retirado de la cadena de chat: se da de baja el 16/08/2026 (auditoría Fable, ítem 73).
@@ -2085,6 +2141,11 @@ async function callAI(messages, config, onToolNotice, userId, ctx) {
     if (userId) saveConfig(userId, { provider, model }).catch(() => {});
   }
 
+  // Guarda el último fallo (modelo + error crudo) fuera de `attempts` a propósito: `attempts` se
+  // persiste tal cual en Firestore vía logAIFailure(), y el objeto Error de axios tiene refs
+  // circulares que romperían ese write.
+  let lastFailure = null;
+
   if (process.env.OPENROUTER_API_KEY) {
     try {
       return await chatWithTools('https://openrouter.ai/api/v1/chat/completions', process.env.OPENROUTER_API_KEY, model, clean, onToolNotice, ctx);
@@ -2092,43 +2153,50 @@ async function callAI(messages, config, onToolNotice, userId, ctx) {
       const detail = error.response?.data?.error?.message || error.message;
       console.error('Error OpenRouter:', detail);
       attempts.push({ provider: 'openrouter', model, error: detail, reason: classifyAIError(error) });
+      lastFailure = { model, error, detail };
     }
   }
 
-  // Fallback final: reemplaza al viejo fallback de Groq (llama-3.3-70b-versatile) — mismo rol,
-  // modelo liviano y estable, pero vía OpenRouter (auditoría Fable, ítem 73).
-  if (process.env.OPENROUTER_API_KEY && model !== 'openai/gpt-oss-20b') {
-    try {
-      return await chatWithTools('https://openrouter.ai/api/v1/chat/completions', process.env.OPENROUTER_API_KEY, 'openai/gpt-oss-20b', clean, onToolNotice, ctx);
-    } catch (error) {
-      const detail = error.response?.data?.error?.message || error.message;
-      console.error('Error fallback gpt-oss-20b:', detail);
-      attempts.push({ provider: 'openrouter', model: 'openai/gpt-oss-20b', error: detail, reason: classifyAIError(error) });
-    }
-  }
-
-  // Fallback de razonamiento: modelo gratuito de OpenRouter, chico y liviano, distinto del default de arriba
-  // (evita reintentar el mismo modelo dos veces si el usuario ya estaba en 'openrouter').
   const alreadyTried = (p, m) => attempts.some(a => a.provider === p && a.model === m) || (provider === p && model === m);
-  if (process.env.OPENROUTER_API_KEY && !alreadyTried('openrouter', 'nvidia/nemotron-3-nano-30b-a3b:free')) {
+
+  // 2do intento de la cadena 100% gratuita (ver MODELS_BY_PROVIDER, reemplazo del 29/08/2026).
+  if (process.env.OPENROUTER_API_KEY && !alreadyTried('openrouter', 'nvidia/nemotron-3-ultra-550b-a55b:free')) {
+    if (lastFailure) await notifyModelFallback(lastFailure.model, 'nvidia/nemotron-3-ultra-550b-a55b:free', lastFailure.error, lastFailure.detail);
     try {
-      return await chatWithTools('https://openrouter.ai/api/v1/chat/completions', process.env.OPENROUTER_API_KEY, 'nvidia/nemotron-3-nano-30b-a3b:free', clean, onToolNotice, ctx);
+      return await chatWithTools('https://openrouter.ai/api/v1/chat/completions', process.env.OPENROUTER_API_KEY, 'nvidia/nemotron-3-ultra-550b-a55b:free', clean, onToolNotice, ctx);
     } catch (error) {
       const detail = error.response?.data?.error?.message || error.message;
-      console.error('Error fallback Nemotron-nano:', detail);
-      attempts.push({ provider: 'openrouter', model: 'nvidia/nemotron-3-nano-30b-a3b:free', error: detail, reason: classifyAIError(error) });
+      console.error('Error fallback Nemotron-3-ultra:', detail);
+      attempts.push({ provider: 'openrouter', model: 'nvidia/nemotron-3-ultra-550b-a55b:free', error: detail, reason: classifyAIError(error) });
+      lastFailure = { model: 'nvidia/nemotron-3-ultra-550b-a55b:free', error, detail };
     }
   }
 
-  // Último recurso: otro modelo distinto (verificado que existe en el catálogo en vivo, aunque al 22/07/2026
-  // devuelve 429 por rate-limit upstream — se deja igual porque puede recuperarse y es mejor que no intentar nada).
-  if (process.env.OPENROUTER_API_KEY && !alreadyTried('openrouter', 'google/gemma-4-31b-it:free')) {
+  // 3er intento de la cadena 100% gratuita.
+  if (process.env.OPENROUTER_API_KEY && !alreadyTried('openrouter', 'minimax/minimax-m3:free')) {
+    if (lastFailure) await notifyModelFallback(lastFailure.model, 'minimax/minimax-m3:free', lastFailure.error, lastFailure.detail);
     try {
-      return await chatWithTools('https://openrouter.ai/api/v1/chat/completions', process.env.OPENROUTER_API_KEY, 'google/gemma-4-31b-it:free', clean, onToolNotice, ctx);
+      return await chatWithTools('https://openrouter.ai/api/v1/chat/completions', process.env.OPENROUTER_API_KEY, 'minimax/minimax-m3:free', clean, onToolNotice, ctx);
     } catch (error) {
       const detail = error.response?.data?.error?.message || error.message;
-      console.error('Error fallback Gemma:', detail);
-      attempts.push({ provider: 'openrouter', model: 'google/gemma-4-31b-it:free', error: detail, reason: classifyAIError(error) });
+      console.error('Error fallback Minimax-M3:', detail);
+      attempts.push({ provider: 'openrouter', model: 'minimax/minimax-m3:free', error: detail, reason: classifyAIError(error) });
+      lastFailure = { model: 'minimax/minimax-m3:free', error, detail };
+    }
+  }
+
+  // Último recurso: router automático de OpenRouter (openrouter/free) — selecciona entre los
+  // modelos gratis disponibles en ese momento, red de seguridad final aunque los tres anteriores
+  // dejen de estar disponibles.
+  if (process.env.OPENROUTER_API_KEY && !alreadyTried('openrouter', 'openrouter/free')) {
+    if (lastFailure) await notifyModelFallback(lastFailure.model, 'openrouter/free', lastFailure.error, lastFailure.detail);
+    try {
+      return await chatWithTools('https://openrouter.ai/api/v1/chat/completions', process.env.OPENROUTER_API_KEY, 'openrouter/free', clean, onToolNotice, ctx);
+    } catch (error) {
+      const detail = error.response?.data?.error?.message || error.message;
+      console.error('Error fallback openrouter/free:', detail);
+      attempts.push({ provider: 'openrouter', model: 'openrouter/free', error: detail, reason: classifyAIError(error) });
+      lastFailure = { model: 'openrouter/free', error, detail };
     }
   }
 
@@ -2275,20 +2343,21 @@ async function extractDocxText(buffer) {
 // ─────────────────────────────────────────
 // CATÁLOGO DE PROVEEDORES/MODELOS (fuente de verdad para validación y mensajes al usuario)
 // ─────────────────────────────────────────
-// Catálogo verificado en vivo contra /v1/models de cada proveedor. Groq retirado como proveedor de
-// chat el 26/07/2026 (se da de baja el 16/08/2026, auditoría Fable ítem 73) — reemplazado por
-// openai/gpt-oss-120b (principal) y openai/gpt-oss-20b (liviano/fallback), ambos vía OpenRouter,
-// confirmados respondiendo en vivo el 26/07/2026. Los modelos gratis de OpenRouter rotan sin aviso,
-// así que si vuelve a fallar todo, este es el primer lugar para re-chequear.
+// Catálogo verificado en vivo contra /v1/models de cada proveedor. Cadena reemplazada el
+// 29/08/2026 (diagnóstico previo confirmó que openai/gpt-oss-120b, el default real, NO es
+// :free — corre contra una cuota diaria chica que se agotó dos veces en 30 días sin avisar) por
+// una cadena 100% de modelos gratuitos (`:free`), los 4 confirmados en vivo el 29/08/2026 con
+// precio $0 y soporte de tools/tool_choice contra /api/v1/models. Los modelos gratis de
+// OpenRouter rotan sin aviso, así que si vuelve a fallar todo, este es el primer lugar para
+// re-chequear.
 const MODELS_BY_PROVIDER = {
   openrouter: {
-    default: 'openai/gpt-oss-120b',
+    default: 'z-ai/glm-5.2:free',
     models: {
-      'openai/gpt-oss-120b': 'Default — modelo principal, más capaz, uso general (reemplazo de Groq)',
-      'openai/gpt-oss-20b': 'Rápido/liviano, fallback automático si falla el principal',
-      'nvidia/nemotron-3-super-120b-a12b:free': 'Grande, razonamiento fuerte, respondió estable en las pruebas',
-      'nvidia/nemotron-3-nano-30b-a3b:free': 'Último recurso del sistema — rápido y liviano, respondió estable en las pruebas',
-      'google/gemma-4-31b-it:free': 'Modelo de Google — existe en el catálogo pero al 22/07/2026 devuelve 429 (rate-limited upstream), probar antes de confiar en él',
+      'z-ai/glm-5.2:free': 'Default — modelo principal, 100% gratuito, uso general',
+      'nvidia/nemotron-3-ultra-550b-a55b:free': '2do intento si falla el principal — grande, razonamiento fuerte, 100% gratuito',
+      'minimax/minimax-m3:free': '3er intento si fallan los dos anteriores — 100% gratuito',
+      'openrouter/free': 'Último recurso — router automático de OpenRouter, selecciona entre los modelos gratis disponibles en ese momento como red de seguridad final',
     },
   },
 };
@@ -2360,12 +2429,10 @@ function parseConfigCommand(text) {
   let provider = t.includes('groq') ? 'groq' : (t.includes('openrouter') ? 'openrouter' : null);
 
   const models = {
-    'gemma': 'google/gemma-4-31b-it:free',
-    'nemotron nano': 'nvidia/nemotron-3-nano-30b-a3b:free',
-    'nemotron': 'nvidia/nemotron-3-super-120b-a12b:free',
-    'gpt-oss-20': 'openai/gpt-oss-20b',
-    'gpt-oss-120': 'openai/gpt-oss-120b',
-    'gpt oss': 'openai/gpt-oss-20b',
+    'glm': 'z-ai/glm-5.2:free',
+    'nemotron': 'nvidia/nemotron-3-ultra-550b-a55b:free',
+    'minimax': 'minimax/minimax-m3:free',
+    'auto': 'openrouter/free',
   };
 
   let model = null;
@@ -2447,7 +2514,7 @@ bot.start(async (ctx) => {
     `/buscar [query] — buscar en la web\n` +
     `/clear — borrar historial\n\n` +
     `O decime en lenguaje natural:\n` +
-    `<i>"Cambiá al modelo gpt-oss-20b"</i>`,
+    `<i>"Cambiá al modelo minimax"</i>`,
     { parse_mode: 'HTML' }
   );
 });
@@ -2938,8 +3005,7 @@ async function buildDailyBrief(userId) {
 
   let calendarTexto = 'no disponible (token vencido, pendiente de reautorización).';
   if (!googleOAuthExpired) {
-    const hoyInicio = new Date(); hoyInicio.setHours(0, 0, 0, 0);
-    const hoyFin = new Date(); hoyFin.setHours(23, 59, 59, 999);
+    const { inicio: hoyInicio, fin: hoyFin } = getArgentinaTodayBounds();
     const evResult = await callGoogleAPI(userId, () =>
       calendarClient.events.list({ calendarId: 'primary', timeMin: hoyInicio.toISOString(), timeMax: hoyFin.toISOString(), singleEvents: true, orderBy: 'startTime' })
     );
