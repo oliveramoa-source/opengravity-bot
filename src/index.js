@@ -2006,6 +2006,26 @@ function looksLikeFakeReadResult(text, calledTools, historyMessages) {
   return false;
 }
 
+// Firma 7 (29/08/2026): link de reautorización inventado. Bug real visto en vivo: el bot mandó
+// "https://auth.opengravity.bot/google/authorize?flow=telegram&user_id=...&sig=..." — un dominio
+// que no existe (confirmado por DNS: NXDOMAIN) ni aparece en ningún lado del código. Mismo patrón
+// fantasma del ítem 113 (ver looksLikeFakeOAuthExpiryNarrative), pero sin el wording
+// "venció/expiró" que atrapa la Firma 5, porque acá el pedido fue on-demand
+// (regenerar_link_reautorizacion), no un aviso automático de vencimiento.
+//
+// No hace falta cruzar contra calledTools como las otras firmas: NINGÚN camino real del código
+// expone jamás el reauthUrl real al modelo. regenerar_link_reautorizacion devuelve un string fijo
+// de confirmación (nunca la URL, ver TOOL_HANDLERS más arriba) y sendReauthLink() manda el link
+// real directo por Telegram como mensaje aparte, detrás de un <a href> — el texto plano del link
+// nunca llega al modelo ni siquiera cuando la herramienta SÍ se llamó de verdad. Por eso cualquier
+// URL http(s) cruda junto con wording de reautorización es garantizado inventada.
+function looksLikeFakeReauthLink(text) {
+  if (!text) return false;
+  const reauthMention = /reautoriz|re-?autoriz/i;
+  const hasRawUrl = /https?:\/\/\S+/i.test(text);
+  return reauthMention.test(text) && hasRawUrl;
+}
+
 async function chatWithTools(url, apiKey, model, messages, onToolNotice, ctx) {
   const headers = { 'Content-Type': 'application/json', Authorization: `Bearer ${apiKey}` };
   let convo = [...messages];
@@ -2082,6 +2102,11 @@ async function chatWithTools(url, apiKey, model, messages, onToolNotice, ctx) {
       if (looksLikeFakeReadResult(msg.content, calledTools, messages)) {
         console.log(`[chatWithTools] ${providerLabel}/${model} ronda ${round + 1}/${MAX_ROUNDS}: respuesta bloqueada por firma de resultado de lectura inventado (sin tool-call real ni respaldo en el historial): ${JSON.stringify(msg.content?.slice(0, 200))}`);
         return 'No pude confirmar esos datos de forma segura — no llegué a consultarlos de nuevo. Pedímelo otra vez y me fijo con una búsqueda real antes de responder.';
+      }
+      // Firma 7 (29/08/2026): link de reautorización inventado (ver looksLikeFakeReauthLink).
+      if (looksLikeFakeReauthLink(msg.content)) {
+        console.log(`[chatWithTools] ${providerLabel}/${model} ronda ${round + 1}/${MAX_ROUNDS}: respuesta bloqueada por firma de link de reautorización inventado: ${JSON.stringify(msg.content?.slice(0, 200))}`);
+        return 'No pude confirmar el link de reautorización de forma segura. Pedímelo de nuevo — si el link real ya te llegó por Telegram como mensaje aparte, usá ese; si no llegó nada, avisame.';
       }
       const cleanContent = stripLeakedReasoningPreamble(msg.content);
       if (cleanContent !== msg.content) {
@@ -2179,6 +2204,10 @@ async function chatWithTools(url, apiKey, model, messages, onToolNotice, ctx) {
       if (looksLikeFakeReadResult(closingMsg.content, calledTools, messages)) {
         console.log(`[chatWithTools] ${providerLabel}/${model}: cierre bloqueado por firma de resultado de lectura inventado: ${JSON.stringify(closingMsg.content?.slice(0, 200))}`);
         return 'No pude confirmar esos datos de forma segura — no llegué a consultarlos de nuevo. Pedímelo otra vez y me fijo con una búsqueda real antes de responder.';
+      }
+      if (looksLikeFakeReauthLink(closingMsg.content)) {
+        console.log(`[chatWithTools] ${providerLabel}/${model}: cierre bloqueado por firma de link de reautorización inventado: ${JSON.stringify(closingMsg.content?.slice(0, 200))}`);
+        return 'No pude confirmar el link de reautorización de forma segura. Pedímelo de nuevo — si el link real ya te llegó por Telegram como mensaje aparte, usá ese; si no llegó nada, avisame.';
       }
       return stripLeakedReasoningPreamble(closingMsg.content);
     }
