@@ -28,6 +28,17 @@ los logs con `httpRequest` de la regla anterior.
 salida de esa sesión (severidad baja, ese secreto no da acceso a Gmail/Calendar/Tasks, pero
 confirma que el mismo patrón de exposición no se limita a los logs de Cloud Run).
 
+## `getWebhookInfo` y endpoints de Telegram que devuelven la URL del webhook: nunca directo
+
+Nunca llamar directo a `getWebhookInfo` (ni a ningún otro endpoint de la API de Telegram cuya
+respuesta incluya la URL del webhook) para un chequeo de salud, ni siquiera uno rápido. Usar
+siempre `scripts/diag-webhook.js`, que ya enmascara el token antes de mostrar el resultado.
+
+**Motivo:** incidente real del 29/08/2026 — la respuesta de `getWebhookInfo` trae el campo `url`
+con el token del bot embebido en el path (`/telegraf/<TOKEN>`, mismo patrón ya documentado en la
+regla de `httpRequest` de arriba), y llamarlo directo lo imprimió en texto plano en la salida de
+esa sesión. Forzó una segunda rotación del `TELEGRAM_BOT_TOKEN` en el mismo día.
+
 ## Lectura de `.env`: bloqueada a nivel de permisos, no solo por instrucción
 
 La lectura de `.env`/`.env.*` de este repo (y de cualquier otro) está bloqueada por un hook
