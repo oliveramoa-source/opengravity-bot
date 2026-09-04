@@ -3223,8 +3223,34 @@ async function buildDailyBrief(userId) {
 const WEBHOOK_PATH = `/telegraf/${process.env.TELEGRAM_BOT_TOKEN}`;
 const PORT = process.env.PORT || 8080;
 
+// Ítem 165 (04/09/2026): Telegraf.handleUpdate() llama a `this.telegram.getMe()` de forma lazy
+// la primera vez que no tiene `botInfo` seteado, y cachea esa MISMA promise para toda la vida de
+// la instancia (this.botInfoCall). Sin bot.launch() (corremos webhook manual, ver comentario más
+// abajo) nunca se pre-carga botInfo, así que cada cold start de Cloud Run dispara un getMe() nuevo;
+// si esa llamada cuelga por la red, la promise cacheada nunca resuelve y CADA update que le llegue
+// a esa instancia se queda esperando para siempre — sin timeout propio (el del cliente HTTP interno
+// de Telegraf es de 500000ms) y sin reintentos. Esto tapaba por completo las respuestas del bot.
+// Precargamos botInfo acá, antes de levantar el server, con timeout acotado y reintentos con
+// backoff — si las 3 fallan, seguimos igual (mismo comportamiento que antes) en vez de colgar el
+// arranque del contenedor.
+async function fetchBotInfoWithRetry(bot, attempts = 3, perAttemptTimeoutMs = 8000) {
+  for (let i = 1; i <= attempts; i++) {
+    try {
+      const timeout = new Promise((_, reject) => setTimeout(() => reject(new Error('timeout')), perAttemptTimeoutMs));
+      bot.botInfo = await Promise.race([bot.telegram.getMe(), timeout]);
+      console.log(`✅ botInfo precargado (intento ${i}/${attempts}): @${bot.botInfo.username}`);
+      return;
+    } catch (err) {
+      console.error(`⚠️ getMe falló (intento ${i}/${attempts}): ${err.message}`);
+      if (i < attempts) await new Promise((r) => setTimeout(r, i * 2000));
+    }
+  }
+  console.error('⚠️ No se pudo precargar botInfo tras los reintentos — Telegraf lo intentará de nuevo por su cuenta en el primer update.');
+}
+
 async function startBot() {
   console.log('🚀 Iniciando OpenGravity Bot (modo webhook)...');
+  await fetchBotInfoWithRetry(bot);
   await testOpenRouter();
   const modelPings = await pingAllCatalogModels();
   const failing = modelPings.filter((m) => !m.ok);
