@@ -1435,7 +1435,7 @@ const TOOL_DEFS = [
     type: 'function',
     function: {
       name: 'estado_cadena_modelos',
-      description: 'Chequea en vivo (ping real contra OpenRouter, reusa el mismo mecanismo del job de las 9hs) el estado de los 4 modelos de la cadena de fallback y devuelve un checklist OK/caído de cada uno, más cuál es el modelo activo ahora mismo según el orden real de fallback. Usala cuando Mariano pregunte algo como "¿cómo están los modelos?", "estado de la cadena", "¿algún modelo está caído?" — es diagnóstico, no sirve para cambiar de modelo (eso es /config).',
+      description: 'Chequea en vivo (ping real contra cada proveedor, reusa el mismo mecanismo del job de las 9hs) el estado de los 7 intentos de las 4 capas de fallback (Groq → Google AI Studio → Cloudflare Workers AI → cadena OpenRouter de 4 modelos) y devuelve un checklist OK/caído/no-configurado de cada uno, más cuál es el modelo activo ahora mismo según el orden real de fallback. Usala cuando Mariano pregunte algo como "¿cómo están los modelos?", "estado de la cadena", "¿algún modelo está caído?" — es diagnóstico, no sirve para cambiar de modelo (eso es /config).',
       parameters: { type: 'object', properties: {} },
     },
   },
@@ -1742,16 +1742,19 @@ const TOOL_HANDLERS = {
     return `Encontré esta regla activa que coincide: id: ${match.id} — "${match.data().texto}". Confirmale a Mariano que es esta antes de desactivarla — volvé a llamar esta misma herramienta con ese id exacto una vez que confirme.`;
   },
 
-  // ítem 152 (29/08/2026) — reusa pingAllCatalogModels() ya existente (job de las 9hs), no
-  // duplica la lógica de ping. "Modelo activo ahora" replica el mismo orden real de callAI():
-  // primero el modelo configurado (config.model, lo que se intenta primero de verdad), después
-  // la cadena fija de fallback tal cual está hardcodeada ahí — no es un dato que pingAllCatalogModels()
-  // devuelva por sí solo, se infiere cruzando ambas cosas.
+  // ítem 152 (29/08/2026), extendido el 18/09/2026 a las 4 capas — reusa pingAllCatalogModels() ya
+  // existente (job de las 9hs), no duplica la lógica de ping. "Modelo activo ahora" replica el
+  // mismo orden real de callAI(): Groq → Google AI Studio → Cloudflare Workers AI → cadena
+  // OpenRouter (config.model o default, después nemotron/minimax/openrouter-free) — no es un dato
+  // que pingAllCatalogModels() devuelva por sí solo, se infiere cruzando ambas cosas.
   estado_cadena_modelos: async (_args, ctx) => {
     const config = await getConfig(ctx.from.id);
     const pings = await pingAllCatalogModels();
     const byModel = Object.fromEntries(pings.map((p) => [p.model, p]));
     const ordenFallback = [
+      MODELS_BY_PROVIDER.groq.default,
+      MODELS_BY_PROVIDER.google.default,
+      MODELS_BY_PROVIDER.cloudflare.default,
       config?.model || MODELS_BY_PROVIDER.openrouter.default,
       'nvidia/nemotron-3-ultra-550b-a55b:free',
       'minimax/minimax-m3:free',
@@ -1759,8 +1762,8 @@ const TOOL_HANDLERS = {
     ];
     const cadenaSinRepetir = [...new Set(ordenFallback)];
     const activo = cadenaSinRepetir.find((m) => byModel[m]?.ok);
-    const lineas = pings.map((p, i) => `${i + 1}. ${p.model} — ${p.ok ? '✅ OK' : `❌ caído${p.detail ? `: ${p.detail}` : ''}`}`);
-    return `Estado de la cadena de modelos:\n${lineas.join('\n')}\nModelo activo ahora: ${activo || 'ninguno — los 4 modelos están caídos en este momento.'}`;
+    const lineas = pings.map((p, i) => `${i + 1}. [${PROVIDER_LABELS[p.provider]}] ${p.model} — ${p.ok ? '✅ OK' : `❌ caído${p.detail ? `: ${p.detail}` : ''}`}`);
+    return `Estado de la cadena de modelos:\n${lineas.join('\n')}\nModelo activo ahora: ${activo || 'ninguno — los 7 intentos de las 4 capas están caídos en este momento.'}`;
   },
 
   // El carril "Project" (buzón Drive por carpeta) tiene desde el ítem 146 (29/08/2026) el scope
@@ -2033,7 +2036,12 @@ async function chatWithTools(url, apiKey, model, messages, onToolNotice, ctx) {
   // herramientas queda invisible en los logs — no tira ningún error, solo devuelve el mensaje
   // genérico. Necesitamos ver qué tool pidió el modelo en cada ronda para decidir el número
   // correcto de rondas con datos reales en vez de conjeturar.
-  const providerLabel = url.includes('groq') ? 'groq' : 'openrouter';
+  // Log de diagnóstico por capa — extendido el 18/09/2026 a las 4 capas (antes solo distinguía
+  // groq/openrouter porque eran las únicas dos URLs posibles).
+  const providerLabel = url.includes('groq') ? 'groq'
+    : url.includes('generativelanguage.googleapis.com') ? 'google'
+    : url.includes('cloudflare.com') ? 'cloudflare'
+    : 'openrouter';
   let lastToolNames = [];
   // Acumula TODAS las herramientas llamadas de verdad en todo el intercambio (no solo la última
   // ronda) — necesario para la Firma 3 de looksLikeFakeCompletedTasksAction más abajo.
@@ -2288,9 +2296,13 @@ async function notifyModelFallback(modeloViejo, modeloNuevo, error, detail) {
 
 async function callAI(messages, config, onToolNotice, userId, ctx) {
   const headers = { 'Content-Type': 'application/json' };
-  // Groq retirado de la cadena de chat: se da de baja el 16/08/2026 (auditoría Fable, ítem 73).
-  // OpenRouter queda como único proveedor de chat. La transcripción de audio (Whisper, en
-  // transcribeAudio()) sigue usando Groq aparte — eso es un reemplazo distinto, todavía en investigación.
+  // Arquitectura de 4 capas (18/09/2026, ítem cadena de fallback IA): Groq (capa 1) → Google AI
+  // Studio (capa 2) → Cloudflare Workers AI (capa 3) → cadena OpenRouter completa (capa 4, último
+  // recurso — nunca capa 1 o 2, ver ítem 64 del ecosistema: rotar modelos gratuitos sin aviso ya
+  // causó una caída total del bot). Groq había sido retirado del chat el 16/08/2026 y vuelve acá
+  // como capa 1 con `openai/gpt-oss-120b` (reemplazo directo de `llama-3.3-70b-versatile`,
+  // deprecado por Groq) — la transcripción de audio (Whisper, en transcribeAudio()) ya usaba Groq
+  // aparte, sin relación con esta cadena de chat.
   let provider = 'openrouter';
   let model = config?.model || MODELS_BY_PROVIDER.openrouter.default;
   const clean = cleanMessages(messages);
@@ -2298,7 +2310,11 @@ async function callAI(messages, config, onToolNotice, userId, ctx) {
 
   // Chequeo de sanidad: si el modelo guardado quedó inválido (retirado/inexistente en el catálogo),
   // resetear al default ANTES de llamar a la API, en vez de intentar con datos que sabemos que van a
-  // fallar. Se persiste para que la próxima consulta ya arranque con una config sana.
+  // fallar. Se persiste para que la próxima consulta ya arranque con una config sana. Cubre las 4
+  // capas (MODELS_BY_PROVIDER ya tiene las 4 keys), aunque `provider` acá solo puede valer
+  // 'openrouter' — es el único proveedor seleccionable a mano por el usuario vía /config (ver
+  // parseConfigCommand); las 3 capas nuevas son parte de la cadena automática fija, no de la config
+  // por usuario.
   if (!isValidModelForProvider(provider, model)) {
     model = MODELS_BY_PROVIDER.openrouter.default;
     if (userId) saveConfig(userId, { provider, model }).catch(() => {});
@@ -2309,7 +2325,60 @@ async function callAI(messages, config, onToolNotice, userId, ctx) {
   // circulares que romperían ese write.
   let lastFailure = null;
 
+  // Capa 1: Groq. Manejo de error propio (no un catch genérico compartido con las otras capas) para
+  // que `attempts`/ai_errors quede diferenciado por proveedor real, no solo por modelo.
+  const groqEndpoint = getProviderEndpoint('groq');
+  if (groqEndpoint.apiKey && groqEndpoint.url) {
+    try {
+      return await chatWithTools(groqEndpoint.url, groqEndpoint.apiKey, MODELS_BY_PROVIDER.groq.default, clean, onToolNotice, ctx);
+    } catch (error) {
+      const detail = error.response?.data?.error?.message || error.message;
+      console.error('Error Groq (capa 1):', detail);
+      attempts.push({ provider: 'groq', model: MODELS_BY_PROVIDER.groq.default, error: detail, reason: classifyAIError(error) });
+      lastFailure = { model: MODELS_BY_PROVIDER.groq.default, error, detail };
+    }
+  }
+
+  // Capa 2: Google AI Studio (Gemini, vía endpoint OpenAI-compatible — soporta tool_calls).
+  const googleEndpoint = getProviderEndpoint('google');
+  if (googleEndpoint.apiKey && googleEndpoint.url) {
+    if (lastFailure) await notifyModelFallback(lastFailure.model, MODELS_BY_PROVIDER.google.default, lastFailure.error, lastFailure.detail);
+    try {
+      return await chatWithTools(googleEndpoint.url, googleEndpoint.apiKey, MODELS_BY_PROVIDER.google.default, clean, onToolNotice, ctx);
+    } catch (error) {
+      const detail = error.response?.data?.error?.message || error.message;
+      console.error('Error Google AI Studio (capa 2):', detail);
+      attempts.push({ provider: 'google', model: MODELS_BY_PROVIDER.google.default, error: detail, reason: classifyAIError(error) });
+      lastFailure = { model: MODELS_BY_PROVIDER.google.default, error, detail };
+    }
+  }
+
+  // Capa 3: Cloudflare Workers AI (edge, vía endpoint OpenAI-compatible — soporta tool_calls).
+  const cloudflareEndpoint = getProviderEndpoint('cloudflare');
+  // Necesita 2 variables (CLOUDFLARE_API_KEY + CLOUDFLARE_ACCOUNT_ID), a diferencia de las otras 3
+  // capas que solo necesitan 1 — si falta una sola de las dos, la llamada nunca llega a intentarse
+  // (no es un error real, es config incompleta), así que sin este log quedaría invisible en Cloud
+  // Run hasta el aviso de las 9hs. No dispara notifyModelFallback() ni toca ai_errors a propósito
+  // (ver revisión del 19/09/2026): no hubo ningún intento real que haya fallado, es solo visibilidad.
+  if (!!cloudflareEndpoint.apiKey !== !!cloudflareEndpoint.url) {
+    console.error(`Cloudflare Workers AI (capa 3) salteada — falta ${cloudflareEndpoint.apiKey ? 'CLOUDFLARE_ACCOUNT_ID' : 'CLOUDFLARE_API_KEY'} (configuración incompleta, no es un fallo de la API).`);
+  }
+  if (cloudflareEndpoint.apiKey && cloudflareEndpoint.url) {
+    if (lastFailure) await notifyModelFallback(lastFailure.model, MODELS_BY_PROVIDER.cloudflare.default, lastFailure.error, lastFailure.detail);
+    try {
+      return await chatWithTools(cloudflareEndpoint.url, cloudflareEndpoint.apiKey, MODELS_BY_PROVIDER.cloudflare.default, clean, onToolNotice, ctx);
+    } catch (error) {
+      const detail = error.response?.data?.error?.message || error.message;
+      console.error('Error Cloudflare Workers AI (capa 3):', detail);
+      attempts.push({ provider: 'cloudflare', model: MODELS_BY_PROVIDER.cloudflare.default, error: detail, reason: classifyAIError(error) });
+      lastFailure = { model: MODELS_BY_PROVIDER.cloudflare.default, error, detail };
+    }
+  }
+
+  // Capa 4 (último recurso, nunca capa 1 o 2 — ver comentario de arriba): cadena OpenRouter
+  // completa, íntegra tal cual estaba antes de esta sesión (4 sub-intentos sin tocar).
   if (process.env.OPENROUTER_API_KEY) {
+    if (lastFailure) await notifyModelFallback(lastFailure.model, model, lastFailure.error, lastFailure.detail);
     try {
       return await chatWithTools('https://openrouter.ai/api/v1/chat/completions', process.env.OPENROUTER_API_KEY, model, clean, onToolNotice, ctx);
     } catch (error) {
@@ -2322,7 +2391,7 @@ async function callAI(messages, config, onToolNotice, userId, ctx) {
 
   const alreadyTried = (p, m) => attempts.some(a => a.provider === p && a.model === m) || (provider === p && model === m);
 
-  // 2do intento de la cadena 100% gratuita (ver MODELS_BY_PROVIDER, reemplazo del 29/08/2026).
+  // 2do intento de la cadena 100% gratuita de OpenRouter (dentro de la capa 4).
   if (process.env.OPENROUTER_API_KEY && !alreadyTried('openrouter', 'nvidia/nemotron-3-ultra-550b-a55b:free')) {
     if (lastFailure) await notifyModelFallback(lastFailure.model, 'nvidia/nemotron-3-ultra-550b-a55b:free', lastFailure.error, lastFailure.detail);
     try {
@@ -2506,21 +2575,39 @@ async function extractDocxText(buffer) {
 // ─────────────────────────────────────────
 // CATÁLOGO DE PROVEEDORES/MODELOS (fuente de verdad para validación y mensajes al usuario)
 // ─────────────────────────────────────────
-// Catálogo verificado en vivo contra /v1/models de cada proveedor. Cadena reemplazada el
-// 29/08/2026 (diagnóstico previo confirmó que openai/gpt-oss-120b, el default real, NO es
-// :free — corre contra una cuota diaria chica que se agotó dos veces en 30 días sin avisar) por
-// una cadena 100% de modelos gratuitos (`:free`), los 4 confirmados en vivo el 29/08/2026 con
-// precio $0 y soporte de tools/tool_choice contra /api/v1/models. Los modelos gratis de
-// OpenRouter rotan sin aviso, así que si vuelve a fallar todo, este es el primer lugar para
+// Arquitectura de 4 capas (18/09/2026, ver callAI()): Groq → Google AI Studio → Cloudflare
+// Workers AI → cadena OpenRouter (4 sub-intentos, reemplazada el 29/08/2026 por la cadena 100%
+// gratuita de abajo). Las primeras 3 capas son proveedores externos independientes, cada una con
+// un solo modelo default (no hace falta más de una opción por capa — a diferencia de OpenRouter,
+// que sí tiene su propia sub-cadena de 4 modelos como último recurso). Los modelos gratis de
+// OpenRouter rotan sin aviso, así que si vuelve a fallar todo, ese es el primer lugar para
 // re-chequear.
 const MODELS_BY_PROVIDER = {
+  groq: {
+    default: 'openai/gpt-oss-120b',
+    models: {
+      'openai/gpt-oss-120b': 'Capa 1 — reemplazo directo de llama-3.3-70b-versatile (deprecado por Groq), gratuito, soporta tools',
+    },
+  },
+  google: {
+    default: 'gemini-3.5-flash-lite',
+    models: {
+      'gemini-3.5-flash-lite': 'Capa 2 — Google AI Studio (endpoint OpenAI-compatible), límite 500 req/día sin tarjeta, soporta tools',
+    },
+  },
+  cloudflare: {
+    default: '@cf/meta/llama-4-scout-17b-16e-instruct',
+    models: {
+      '@cf/meta/llama-4-scout-17b-16e-instruct': 'Capa 3 — Cloudflare Workers AI, edge, ~10.000 Neurons/día, soporta tools',
+    },
+  },
   openrouter: {
     default: 'z-ai/glm-5.2:free',
     models: {
-      'z-ai/glm-5.2:free': 'Default — modelo principal, 100% gratuito, uso general',
-      'nvidia/nemotron-3-ultra-550b-a55b:free': '2do intento si falla el principal — grande, razonamiento fuerte, 100% gratuito',
-      'minimax/minimax-m3:free': '3er intento si fallan los dos anteriores — 100% gratuito',
-      'openrouter/free': 'Último recurso — router automático de OpenRouter, selecciona entre los modelos gratis disponibles en ese momento como red de seguridad final',
+      'z-ai/glm-5.2:free': 'Capa 4 (1er intento de la cadena OpenRouter) — 100% gratuito, uso general',
+      'nvidia/nemotron-3-ultra-550b-a55b:free': 'Capa 4 (2do intento) — grande, razonamiento fuerte, 100% gratuito',
+      'minimax/minimax-m3:free': 'Capa 4 (3er intento) — 100% gratuito',
+      'openrouter/free': 'Capa 4 (último recurso) — router automático de OpenRouter, selecciona entre los modelos gratis disponibles en ese momento',
     },
   },
 };
@@ -2529,7 +2616,28 @@ function isValidModelForProvider(provider, model) {
   return !!MODELS_BY_PROVIDER[provider]?.models[model];
 }
 
-const PROVIDER_LABELS = { openrouter: 'OpenRouter' };
+const PROVIDER_LABELS = { groq: 'Groq', google: 'Google AI Studio', cloudflare: 'Cloudflare Workers AI', openrouter: 'OpenRouter' };
+
+// URL y env var de API key por proveedor — compartido por callAI() y pingAllCatalogModels() para
+// no repetir el armado de URL (Cloudflare necesita el Account ID en el path) en varios lugares.
+// url:null si al proveedor le falta configuración (permite distinguir "no configurado todavía"
+// de "configurado pero falló", en vez de intentar la llamada igual y fallar por 401/404).
+function getProviderEndpoint(provider) {
+  switch (provider) {
+    case 'groq':
+      return { url: 'https://api.groq.com/openai/v1/chat/completions', apiKey: process.env.GROQ_API_KEY || null };
+    case 'google':
+      return { url: 'https://generativelanguage.googleapis.com/v1beta/openai/chat/completions', apiKey: process.env.GOOGLE_AI_API_KEY || null };
+    case 'cloudflare':
+      return process.env.CLOUDFLARE_ACCOUNT_ID
+        ? { url: `https://api.cloudflare.com/client/v4/accounts/${process.env.CLOUDFLARE_ACCOUNT_ID}/ai/v1/chat/completions`, apiKey: process.env.CLOUDFLARE_API_KEY || null }
+        : { url: null, apiKey: null };
+    case 'openrouter':
+      return { url: 'https://openrouter.ai/api/v1/chat/completions', apiKey: process.env.OPENROUTER_API_KEY || null };
+    default:
+      return { url: null, apiKey: null };
+  }
+}
 
 // buildModelCatalogText() usa backticks Markdown a propósito (se reutiliza también en el system
 // prompt en texto plano, ahí no importa el formato) — acá, para el mensaje real de Telegram, se
@@ -2610,9 +2718,11 @@ FECHA Y HORA ACTUAL EN ARGENTINA (usá esto como referencia exacta para calcular
 // ─────────────────────────────────────────
 function parseConfigCommand(text) {
   const t = text.toLowerCase();
-  // Groq retirado como proveedor de chat (ver MODELS_BY_PROVIDER) — se deja reconocer 'groq' a
-  // propósito para que isValidModelForProvider() lo rechace explícitamente con el catálogo, en vez
-  // de caer en un no-op silencioso que reporte "✅ actualizada" sin haber cambiado nada.
+  // Groq volvió a la cadena el 18/09/2026, pero solo como capa automática fija (ver callAI) — no
+  // es seleccionable a mano por /config. Se deja reconocer 'groq' acá a propósito para que el
+  // chequeo de `newProvider !== 'openrouter'` (más abajo, en el handler de /config) lo rechace
+  // explícitamente con el catálogo, en vez de caer en un no-op silencioso que reporte
+  // "✅ actualizada" sin haber cambiado nada.
   let provider = t.includes('groq') ? 'groq' : (t.includes('openrouter') ? 'openrouter' : null);
 
   const models = {
@@ -2980,9 +3090,12 @@ async function handleUserText(ctx, text) {
     const newProvider = provider || current.provider;
     let newModel = model || current.model;
 
-    // Proveedor inexistente en el catálogo (ej. "groq", retirado) — rechazar explícito, sin
-    // intentar leer un default que no existe.
-    if (!MODELS_BY_PROVIDER[newProvider]) {
+    // /config solo deja elegir a mano un modelo DENTRO de OpenRouter (capa 4). Groq/Google/
+    // Cloudflare (capas 1-3, agregadas el 18/09/2026) son parte de la cadena automática fija de
+    // callAI() y no son seleccionables por usuario — si se les permitiera acá, callAI() las
+    // ignoraría igual (siempre arranca por la cadena fija) y el auto-corrector revertiría la config
+    // guardada en el próximo mensaje real, mostrando un "✅ actualizada" que en la práctica no hace nada.
+    if (newProvider !== 'openrouter') {
       return ctx.reply(formatModelCatalog(), { parse_mode: 'HTML' });
     }
 
@@ -3135,10 +3248,13 @@ bot.on('document', async (ctx) => {
 // ─────────────────────────────────────────
 // ARRANQUE
 // ─────────────────────────────────────────
-// Reemplaza al viejo testGroq(): el chequeo de sanidad de arranque ahora valida OpenRouter, que es
-// el único proveedor de chat desde que se retiró Groq (ver MODELS_BY_PROVIDER). max_tokens en 50 y
-// no en 5: los modelos gpt-oss son de razonamiento y gastan tokens en el razonamiento oculto antes
-// del contenido final — con un límite muy chico el content vuelve null y esto tiraría un TypeError.
+// Reemplaza al viejo testGroq(): el chequeo de sanidad de arranque valida OpenRouter (capa 4,
+// último recurso de la cadena — ver MODELS_BY_PROVIDER). Las capas 1-3 (Groq/Google/Cloudflare,
+// agregadas el 18/09/2026) se chequean en pingAllCatalogModels() de abajo, no acá — este chequeo
+// puntual de arranque se deja enfocado en OpenRouter porque es el que nunca puede faltar (única
+// capa sin API key opcional en la práctica). max_tokens en 50 y no en 5: los modelos gpt-oss son
+// de razonamiento y gastan tokens en el razonamiento oculto antes del contenido final — con un
+// límite muy chico el content vuelve null y esto tiraría un TypeError.
 async function testOpenRouter() {
   if (!process.env.OPENROUTER_API_KEY) { console.log('⚠️ OPENROUTER_API_KEY no definida'); return; }
   try {
@@ -3152,19 +3268,30 @@ async function testOpenRouter() {
   }
 }
 
-// A3: ping a CADA modelo del catálogo (no solo el default), al arranque y en el job de las 9hs —
-// si alguno falla, se avisa en vez de fallar en silencio (mismo criterio de testOpenRouter()).
+// A3: ping a CADA modelo del catálogo de las 4 capas (no solo OpenRouter), al arranque y en el job
+// de las 9hs — si alguno falla, se avisa en vez de fallar en silencio (mismo criterio de
+// testOpenRouter()). Generalizado el 18/09/2026 para cubrir Groq/Google/Cloudflare vía
+// getProviderEndpoint() — antes solo recorría MODELS_BY_PROVIDER.openrouter.models a mano. Si a un
+// proveedor le falta la API key todavía (getProviderEndpoint devuelve url/apiKey null), se reporta
+// como "no configurado" en vez de intentar la llamada y fallar con un 401 confuso.
 async function pingAllCatalogModels() {
   const results = [];
-  for (const model of Object.keys(MODELS_BY_PROVIDER.openrouter.models)) {
-    try {
-      await axios.post('https://openrouter.ai/api/v1/chat/completions',
-        { model, messages: [{ role: 'user', content: 'di hola' }], max_tokens: 50 },
-        { headers: { Authorization: `Bearer ${process.env.OPENROUTER_API_KEY}`, 'Content-Type': 'application/json' }, timeout: 15000 }
-      );
-      results.push({ model, ok: true });
-    } catch (e) {
-      results.push({ model, ok: false, detail: e.response?.data?.error?.message || e.message });
+  for (const [provider, info] of Object.entries(MODELS_BY_PROVIDER)) {
+    const { url, apiKey } = getProviderEndpoint(provider);
+    for (const model of Object.keys(info.models)) {
+      if (!url || !apiKey) {
+        results.push({ provider, model, ok: false, detail: 'no configurado (falta la API key en variables de entorno)' });
+        continue;
+      }
+      try {
+        await axios.post(url,
+          { model, messages: [{ role: 'user', content: 'di hola' }], max_tokens: 50 },
+          { headers: { Authorization: `Bearer ${apiKey}`, 'Content-Type': 'application/json' }, timeout: 15000 }
+        );
+        results.push({ provider, model, ok: true });
+      } catch (e) {
+        results.push({ provider, model, ok: false, detail: e.response?.data?.error?.message || e.message });
+      }
     }
   }
   return results;
