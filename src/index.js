@@ -89,14 +89,13 @@ bot.use(async (ctx, next) => {
 // restringido gmail.modify. Consecuencia aceptada: el refresh token vence cada 7 días; ver
 // handleOAuthExpiry() más abajo para la detección + aviso proactivo)
 // ─────────────────────────────────────────
-// ítem 146 (29/08/2026): se agrega drive.readonly, no drive/drive.file. Mínimo privilegio real —
-// implementado de verdad el 22/09/2026 (ver PROJECT_FOLDERS, listar_archivos_project,
-// leer_archivo_project): el carril "Projects" ya LEE archivos reales de cada Project con este
-// scope. La escritura (crear/editar/compartir) sigue sin implementar — necesita `drive.file`, que
-// Mariano va a autorizar en una reautorización aparte (semana del 22/09/2026), no se adelanta acá
-// sin el scope real en mano. Proyecto en modo "Testing" con un solo usuario (Mariano): agregar un
-// scope nuevo no dispara verificación de Google ni tiene costo, pero sí exige que Mariano vuelva a
-// pasar por la pantalla de consentimiento la próxima vez que reautorice.
+// ítem 146 (29/08/2026): se agrega drive.readonly, después ítem 159 Parte A (22/09/2026) agrega
+// drive.file — reautorizado en vivo el mismo día (Secret Manager v10). Con ambos scopes el carril
+// "Projects" LEE (listar_archivos_project/leer_archivo_project, 22/09/2026) y CREA archivos nuevos
+// (crear_archivo_project, ítem 159 Parte B, 22/09/2026) — editar un archivo existente o compartirlo
+// sigue sin implementar, eso es H2/H3. Proyecto en modo "Testing" con un solo usuario (Mariano):
+// agregar un scope nuevo no dispara verificación de Google ni tiene costo, pero sí exige que
+// Mariano vuelva a pasar por la pantalla de consentimiento la próxima vez que reautorice.
 const GOOGLE_OAUTH_SCOPES = [
   'https://www.googleapis.com/auth/gmail.send',
   'https://www.googleapis.com/auth/gmail.modify',
@@ -336,6 +335,28 @@ function mimeTypeLabel(mimeType) {
   return PROJECT_MIME_LABELS[mimeType] || mimeType;
 }
 
+// Todo archivo que el Bot escribe en Drive lleva el sufijo " - bot" (regla de Mariano, ítem 159
+// Parte B) — se inserta antes de la extensión para que el tipo de archivo se siga reconociendo a
+// simple vista ("Informe - bot.md", no "Informe.md - bot").
+function withBotSuffix(nombreArchivo) {
+  const nombre = (nombreArchivo || '').trim();
+  const i = nombre.lastIndexOf('.');
+  if (i <= 0) return `${nombre} - bot`;
+  return `${nombre.slice(0, i)} - bot${nombre.slice(i)}`;
+}
+
+const EXTENSION_MIME_TYPES = {
+  '.md': 'text/markdown',
+  '.txt': 'text/plain',
+  '.csv': 'text/csv',
+  '.json': 'application/json',
+  '.html': 'text/html',
+};
+function mimeTypeForExtension(nombreArchivo) {
+  const match = /\.[a-z0-9]+$/i.exec(nombreArchivo || '');
+  return (match && EXTENSION_MIME_TYPES[match[0].toLowerCase()]) || 'text/plain';
+}
+
 // Lee un archivo de Drive como texto plano sea cual sea su formato. Reusa extractPdfText()/
 // extractDocxText() (ya existentes para documentos subidos por Telegram, ver sección DOCUMENTOS más
 // abajo — function declarations, hoisted, se pueden referenciar acá arriba sin problema) en vez de
@@ -372,6 +393,56 @@ async function readProjectFileContent(userId, fileId, mimeType, fileName) {
     driveClient.files.get({ fileId, alt: 'media' }, { responseType: 'text' })
   );
   return result.ok ? { ok: true, data: result.data.data } : result;
+}
+
+// Crea un archivo NUEVO en la carpeta de Drive de un Project — nunca sobreescribe uno existente
+// (Drive permite nombres duplicados sin problema; acá directamente no se busca ni se toca ningún
+// archivo previo). El nombre ya llega con el sufijo " - bot" aplicado (ver withBotSuffix) — esta
+// función no lo agrega, solo ejecuta y audita. Mismo patrón que gmailSend()/gmailTrash(): recibe
+// userId + payload, ejecuta contra la API real, y registra en log_acciones antes de devolver.
+async function driveCreateFile(userId, { folderId, folderLabel, nombreArchivo, contenido, mimeType }) {
+  const result = await callGoogleAPI(userId, () =>
+    driveClient.files.create({
+      requestBody: { name: nombreArchivo, parents: [folderId], mimeType },
+      media: { mimeType, body: contenido },
+      fields: 'id,name,webViewLink',
+    })
+  );
+  await logAccion({
+    accion: 'drive_crear_archivo',
+    destinatario_o_archivo: `${folderLabel}/${nombreArchivo}`,
+    confirmada: true,
+    resultado: result.ok ? `creado, id ${result.data.data.id}` : (result.expired ? 'token vencido' : `error: ${result.error}`),
+  });
+  return result;
+}
+
+// Lee un archivo de un Project y lo procesa con IA (callAIForProject, definida más abajo — es
+// function declaration hoisted, se puede referenciar acá arriba sin problema). Compartida entre
+// el camino directo (Project no sensible, leer_archivo_project la llama de una) y el camino
+// gateado (Project sensible, se llama recién después de que Mariano confirma por botón — ver
+// runPendingAction). Mismo shape {ok,text}/{ok:false,expired,error} que el resto de las funciones
+// de este carril.
+async function readAndProcessProjectFile(userId, { projectKey, folderLabel, fileId, mimeType, fileName, instruccion }) {
+  const contentResult = await readProjectFileContent(userId, fileId, mimeType, fileName);
+  if (!contentResult.ok) {
+    return {
+      ok: false,
+      expired: contentResult.expired,
+      error: contentResult.expired
+        ? 'El token de Drive está vencido, pendiente de reautorización de Mariano.'
+        : (contentResult.error || `No pude leer "${fileName}".`),
+    };
+  }
+  const contenido = (contentResult.data || '').slice(0, 40000);
+  const aiResult = await callAIForProject(
+    projectKey,
+    'Sos un asistente que procesa un documento puntual de un Project. Respondé directo, en español rioplatense, sin inventar contenido que no esté en el documento.',
+    `Instrucción: ${instruccion}\n\nContenido del archivo "${fileName}":\n\n${contenido}`
+  );
+  if (!aiResult.ok) return { ok: false, error: aiResult.error };
+  await logAccion({ accion: 'leer_archivo_project', destinatario_o_archivo: `${folderLabel}/${fileName}`, confirmada: true, resultado: `procesado con ${aiResult.provider}/${aiResult.model}` });
+  return { ok: true, text: aiResult.text };
 }
 
 // ─────────────────────────────────────────
@@ -900,6 +971,11 @@ const ACTION_LABELS = {
   calendar_delete: { display: 'Borrar', letter: 'B', synonyms: ['borrar', 'eliminar'] },
   tasks_delete_item: { display: 'Borrar', letter: 'B', synonyms: ['borrar', 'eliminar'] },
   tasks_delete_list: { display: 'Borrar', letter: 'B', synonyms: ['borrar', 'eliminar'] },
+  // Ítem 159 Parte B (22/09/2026): gate de autorización explícita para Projects sensibles (Dr.
+  // Civil, Dr. Penal, Dr. Laboral, Bróker) — lectura O escritura, sin excepción, regla dura de
+  // Mariano. Letras L/R elegidas para no chocar con 'C' (reservada para cancelar).
+  project_sensible_leer: { display: 'Leer', letter: 'L', synonyms: ['leer', 'procesar', 'procesalo'] },
+  project_sensible_crear: { display: 'creaR', letter: 'R', synonyms: ['crear', 'crealo', 'creá', 'crea'] },
 };
 const DEFAULT_ACTION_LABEL = { display: 'Confirmar', letter: 'F', synonyms: [] };
 
@@ -985,13 +1061,26 @@ async function runPendingAction({ kind, payload, userId }) {
   else if (kind === 'calendar_delete') result = await calendarDeleteEvent(userId, payload.eventId, payload.hasAttendees);
   else if (kind === 'tasks_delete_item') result = await tasksDelete(userId, payload.taskId, payload.tasklistId);
   else if (kind === 'tasks_delete_list') result = await tasksDeleteList(userId, payload.tasklistId);
+  else if (kind === 'project_sensible_crear') result = await driveCreateFile(userId, payload);
+  else if (kind === 'project_sensible_leer') result = await readAndProcessProjectFile(userId, payload);
   else return { ok: false, error: 'Tipo de confirmación no reconocido.' };
   return result;
 }
 
+// Límite de Telegram: 4096 caracteres por mensaje. editMessageText suma esto a lo que ya tiene el
+// preview del borrador — se recorta con margen para no pisar ese tope (visto en producción con
+// leer_archivo_project: el resumen de la IA para un Project sensible puede ser largo).
+const CONFIRMATION_TEXT_LIMIT = 3000;
+
 function formatConfirmationOutcome(result) {
-  if (result.expired) return '⚠️ No pude ejecutarlo: el token de Gmail/Calendar venció. Ya te mandé el link de reautorización.';
+  if (result.expired) return '⚠️ No pude ejecutarlo: el token de Gmail/Calendar/Drive venció. Ya te mandé el link de reautorización.';
   if (!result.ok) return `❌ Falló: ${escapeHtml(result.error)}`;
+  // project_sensible_leer devuelve el resumen real de la IA (no un simple ok/fail) — se muestra
+  // tal cual en vez del genérico "confirmado y ejecutado" de las demás acciones gateadas.
+  if (result.text) {
+    const texto = result.text.length > CONFIRMATION_TEXT_LIMIT ? `${result.text.slice(0, CONFIRMATION_TEXT_LIMIT)}…` : result.text;
+    return `✅ ${escapeHtml(texto)}`;
+  }
   return '✅ Listo, confirmado y ejecutado.';
 }
 
@@ -1620,7 +1709,7 @@ const TOOL_DEFS = [
     type: 'function',
     function: {
       name: 'leer_archivo_project',
-      description: 'Lee un archivo existente en la carpeta de Drive de un Project y lo procesa con IA según la instrucción de Mariano (resumir, extraer datos, responder una pregunta sobre el contenido, etc.). Para Projects sensibles (Dr. Civil, Dr. Penal, Bróker) usa EXCLUSIVAMENTE Groq — si Groq no responde, la operación se aborta sin caer a ningún otro proveedor, nunca se procesa contenido sensible con otro modelo. Si no tenés el nombre exacto del archivo, llamá primero a listar_archivos_project.',
+      description: 'Lee un archivo existente en la carpeta de Drive de un Project y lo procesa con IA según la instrucción de Mariano (resumir, extraer datos, responder una pregunta sobre el contenido, etc.). Para Projects sensibles (Dr. Civil, Dr. Penal, Dr. Laboral, Bróker) usa EXCLUSIVAMENTE Groq — si Groq no responde, la operación se aborta sin caer a ningún otro proveedor, nunca se procesa contenido sensible con otro modelo — y además pide confirmación explícita por botones ANTES de leer nada (vos solo llamás la herramienta normal, el gate lo maneja el código). Si no tenés el nombre exacto del archivo, llamá primero a listar_archivos_project.',
       parameters: {
         type: 'object',
         properties: {
@@ -1629,6 +1718,22 @@ const TOOL_DEFS = [
           instruccion: { type: 'string', description: 'Qué hacer con el contenido — ej. "resumí los puntos clave", "extraé las fechas mencionadas".' },
         },
         required: ['proyecto', 'archivo', 'instruccion'],
+      },
+    },
+  },
+  {
+    type: 'function',
+    function: {
+      name: 'crear_archivo_project',
+      description: 'Crea un archivo NUEVO de texto (nunca sobreescribe uno existente) en la carpeta de Drive de un Project. El nombre final lleva siempre el sufijo " - bot" agregado automáticamente antes de la extensión (vos pasás el nombre sin ese sufijo, el código lo agrega). Para Projects sensibles (Dr. Civil, Dr. Penal, Dr. Laboral, Bróker) pide confirmación explícita por botones ANTES de crear nada — vos solo llamás la herramienta normal, el gate lo maneja el código. Todavía no soporta editar un archivo existente ni compartirlo con terceros, eso sigue fuera de alcance.',
+      parameters: {
+        type: 'object',
+        properties: {
+          proyecto: { type: 'string', description: 'Nombre del Project.' },
+          nombre_archivo: { type: 'string', description: 'Nombre del archivo CON extensión, ej. "Informe.md", "Notas.txt" — sin el sufijo " - bot", eso lo agrega el código.' },
+          contenido: { type: 'string', description: 'Texto completo del archivo a crear.' },
+        },
+        required: ['proyecto', 'nombre_archivo', 'contenido'],
       },
     },
   },
@@ -1945,13 +2050,14 @@ const TOOL_HANDLERS = {
   },
 
   // El carril "Project" (buzón Drive por carpeta) tiene desde el ítem 146 (29/08/2026) el scope
-  // drive.readonly autorizado — implementado de verdad el 22/09/2026: inventario y lectura+
-  // procesamiento (ver listar_archivos_project/leer_archivo_project más abajo) ya funcionan.
-  // La escritura (crear/derivar archivos nuevos en Drive) sigue en pausa — necesita el scope
-  // drive.file, todavía no autorizado por Mariano (ver handoff). Por eso este tool sigue sin tocar
-  // Drive: solo encola el pedido en tareas_hermes para cuando haya un agente (Hermes) que lo
-  // ejecute — comparte la misma escritura que derivar_tarea_hermes (encolarPedido()), con
-  // project_destino resuelto contra PROJECT_FOLDERS.
+  // drive.readonly autorizado, más drive.file desde el ítem 159 (22/09/2026) — inventario, lectura+
+  // procesamiento y creación de archivos (ver listar_archivos_project/leer_archivo_project/
+  // crear_archivo_project más abajo) ya funcionan. Esta tool en particular sigue sin tocar Drive
+  // directo A PROPÓSITO, no por falta de scope: es para pedidos multi-paso que necesitan un agente
+  // (Hermes, todavía no instalado) razonando sobre el pedido, no un archivo puntual que el Bot
+  // pueda crear de una — eso es crear_archivo_project. Solo encola el pedido en tareas_hermes,
+  // comparte la misma escritura que derivar_tarea_hermes (encolarPedido()), con project_destino
+  // resuelto contra PROJECT_FOLDERS.
   derivar_tarea_project: async ({ proyecto, titulo, instruccion, contexto, criterio_exito, entregable_tipo, entregable_destino, prioridad }) => {
     const projectKey = resolveProjectKey(proyecto);
     if (!projectKey) {
@@ -2022,21 +2128,54 @@ const TOOL_HANDLERS = {
       return `Encontré varios archivos que coinciden con "${archivo}" en "${folder.label}":\n${matches.map((f) => `• ${f.name}`).join('\n')}\nDecime el nombre exacto.`;
     }
     const file = matches[0];
-    const contentResult = await readProjectFileContent(ctx.from.id, file.id, file.mimeType, file.name);
-    if (!contentResult.ok) {
-      return contentResult.expired
-        ? 'El token de Drive está vencido, pendiente de reautorización de Mariano.'
-        : contentResult.error || `No pude leer "${file.name}".`;
+    // Ítem 159 Parte B (22/09/2026): regla dura de Mariano — cualquier carpeta sensible, lectura O
+    // escritura, pide autorización explícita en el momento, sin excepción. Antes de esto, el
+    // Project sensible solo restringía el PROVEEDOR de IA (Groq-only, ver callAIForProject) sin
+    // avisarle nada a Mariano — se ejecutaba en silencio. Reusa el mismo mecanismo de botones ya
+    // probado en producción para Gmail/Calendar/Tasks (askConfirmation/runPendingAction), no uno
+    // nuevo.
+    if (isProjectSensible(projectKey)) {
+      await askConfirmation(ctx, {
+        kind: 'project_sensible_leer',
+        payload: { projectKey, folderLabel: folder.label, fileId: file.id, mimeType: file.mimeType, fileName: file.name, instruccion },
+        preview: `📄 <b>¿Proceso este archivo de "${escapeHtml(folder.label)}" (Project SENSIBLE)?</b>\n\nArchivo: ${escapeHtml(file.name)}\nInstrucción: ${escapeHtml(instruccion)}`,
+      });
+      return 'Le mostré la propuesta a Mariano con botones de confirmación — es un Project sensible, no se procesó nada todavía.';
     }
-    const contenido = (contentResult.data || '').slice(0, 40000);
-    const aiResult = await callAIForProject(
-      projectKey,
-      'Sos un asistente que procesa un documento puntual de un Project. Respondé directo, en español rioplatense, sin inventar contenido que no esté en el documento.',
-      `Instrucción: ${instruccion}\n\nContenido del archivo "${file.name}":\n\n${contenido}`
-    );
-    if (!aiResult.ok) return aiResult.error;
-    await logAccion({ accion: 'leer_archivo_project', destinatario_o_archivo: `${folder.label}/${file.name}`, confirmada: true, resultado: `procesado con ${aiResult.provider}/${aiResult.model}` });
-    return aiResult.text;
+    const result = await readAndProcessProjectFile(ctx.from.id, { projectKey, folderLabel: folder.label, fileId: file.id, mimeType: file.mimeType, fileName: file.name, instruccion });
+    if (!result.ok) return result.error;
+    return result.text;
+  },
+
+  crear_archivo_project: async ({ proyecto, nombre_archivo, contenido }, ctx) => {
+    const projectKey = resolveProjectKey(proyecto);
+    if (!projectKey) {
+      return `No reconozco "${proyecto}" como un Project con carpeta de Drive confirmada. Los disponibles hoy son: ${listaProjectsDisponibles()}.`;
+    }
+    if (!nombre_archivo || !contenido) {
+      return 'Falta nombre_archivo y/o contenido — no se creó ningún archivo.';
+    }
+    const folder = PROJECT_FOLDERS[projectKey];
+    const nombreFinal = withBotSuffix(nombre_archivo);
+    const mimeType = mimeTypeForExtension(nombreFinal);
+    // Mismo gate que leer_archivo_project — ver comentario ahí arriba. Escritura en un Project
+    // sensible pide confirmación explícita igual que la lectura, sin excepción.
+    if (isProjectSensible(projectKey)) {
+      const previewContenido = escapeHtml(contenido.slice(0, 300));
+      await askConfirmation(ctx, {
+        kind: 'project_sensible_crear',
+        payload: { folderId: folder.folderId, folderLabel: folder.label, nombreArchivo: nombreFinal, contenido, mimeType },
+        preview: `📁 <b>¿Creo este archivo en "${escapeHtml(folder.label)}" (Project SENSIBLE)?</b>\n\nArchivo: ${escapeHtml(nombreFinal)}\n\n"${previewContenido}${contenido.length > 300 ? '…' : ''}"`,
+      });
+      return 'Le mostré la propuesta a Mariano con botones de confirmación — es un Project sensible, no se creó nada todavía.';
+    }
+    const result = await driveCreateFile(ctx.from.id, { folderId: folder.folderId, folderLabel: folder.label, nombreArchivo: nombreFinal, contenido, mimeType });
+    if (!result.ok) {
+      return result.expired
+        ? 'El token de Drive está vencido, pendiente de reautorización de Mariano.'
+        : `No pude crear el archivo en "${folder.label}": ${result.error}`;
+    }
+    return `Archivo creado en "${folder.label}": ${nombreFinal}.`;
   },
 
   derivar_tarea_hermes: async ({ titulo, instruccion, contexto, criterio_exito, entregable_tipo, entregable_destino, proyecto, prioridad }) => {
@@ -3651,7 +3790,7 @@ async function buildDailyBrief(userId) {
     `📋 <b>Aviso diario — ${escapeHtml(getArgentinaDateTime())}</b>\n\n` +
     `<b>Bot (ayer):</b>\n${resumenAcciones}\n\n` +
     `<b>Hermes:</b>\n${escapeHtml(hermesTexto)}\n\n` +
-    `<b>Projects:</b>\nlectura/inventario de Drive disponible (${Object.keys(PROJECT_FOLDERS).length} de 8 Projects con carpeta confirmada). Escritura pendiente del scope drive.file.\n\n` +
+    `<b>Projects:</b>\nlectura/inventario/creación de archivos en Drive disponible (${Object.keys(PROJECT_FOLDERS).length} de 8 Projects con carpeta confirmada). Carpetas sensibles piden confirmación explícita antes de leer o crear.\n\n` +
     `<b>Calendar hoy:</b>\n${calendarTexto}\n\n` +
     `<b>Token Gmail/Calendar/Tasks:</b> ${googleOAuthExpired ? '⚠️ vencido, pendiente de reautorización.' : 'OK.'}\n\n` +
     `<b>Modelos (catálogo A3):</b> ${modelosTexto}`
