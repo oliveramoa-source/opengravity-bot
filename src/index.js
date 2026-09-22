@@ -103,6 +103,7 @@ const GOOGLE_OAUTH_SCOPES = [
   'https://www.googleapis.com/auth/calendar.events',
   'https://www.googleapis.com/auth/tasks',
   'https://www.googleapis.com/auth/drive.readonly',
+  'https://www.googleapis.com/auth/drive.file',
 ];
 
 // Ruta pública que recibe el redirect de Google al completar el consent screen (ítem 97 fix): sin
