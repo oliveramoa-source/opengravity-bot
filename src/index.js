@@ -295,13 +295,23 @@ function normalizeProjectText(s) {
   return (s || '').toLowerCase().normalize('NFD').replace(/[̀-ͯ]/g, '').trim();
 }
 
+// Resolución en 2 pasos: primero match EXACTO (key o label completo, sin ambigüedad posible).
+// Si no hay exacto, substring en cualquier dirección — pero solo se acepta si da un único
+// candidato. Autorrevisión del 22/09/2026 encontró que la versión anterior (un solo .find())
+// podía resolver en silencio un texto corto/genérico (ej. "dr.") al primer proyecto que matcheara
+// por orden de inserción del objeto, en vez de tratarlo como ambiguo — acá, si "dr." matchea más
+// de un proyecto, se devuelve null (el caller ya maneja projectKey null mostrando el catálogo).
 function resolveProjectKey(nombre) {
   const t = normalizeProjectText(nombre);
   if (!t) return null;
-  return Object.keys(PROJECT_FOLDERS).find((k) => {
+  const keys = Object.keys(PROJECT_FOLDERS);
+  const exacto = keys.find((k) => normalizeProjectText(k) === t || normalizeProjectText(PROJECT_FOLDERS[k].label) === t);
+  if (exacto) return exacto;
+  const candidatos = keys.filter((k) => {
     const kn = normalizeProjectText(k);
-    return t.includes(kn) || kn.includes(t) || t.includes(normalizeProjectText(PROJECT_FOLDERS[k].label));
-  }) || null;
+    return t.includes(kn) || (t.length >= 4 && kn.includes(t)) || t.includes(normalizeProjectText(PROJECT_FOLDERS[k].label));
+  });
+  return candidatos.length === 1 ? candidatos[0] : null;
 }
 
 function isProjectSensible(projectKey) {
