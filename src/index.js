@@ -89,14 +89,14 @@ bot.use(async (ctx, next) => {
 // restringido gmail.modify. Consecuencia aceptada: el refresh token vence cada 7 días; ver
 // handleOAuthExpiry() más abajo para la detección + aviso proactivo)
 // ─────────────────────────────────────────
-// ítem 146 (29/08/2026): se agrega drive.readonly, no drive/drive.file. Mínimo privilegio real:
-// hoy no hay ningún código que escriba en Drive (derivar_tarea_project sigue sin implementar la
-// escritura), y lo único planificado para el corto plazo es que el carril "Projects" pueda LEER
-// archivos de contexto de cada Project — si el día de mañana hace falta escribir/compartir (H2/H3
-// según el .md base), ese es motivo para pedir drive.file en una sesión aparte, no para adelantarlo
-// ahora sin un uso real detrás. Proyecto en modo "Testing" con un solo usuario (Mariano): agregar
-// un scope de solo lectura no dispara verificación de Google ni tiene costo, pero sí exige que
-// Mariano vuelva a pasar por la pantalla de consentimiento la próxima vez que use el bot.
+// ítem 146 (29/08/2026): se agrega drive.readonly, no drive/drive.file. Mínimo privilegio real —
+// implementado de verdad el 22/09/2026 (ver PROJECT_FOLDERS, listar_archivos_project,
+// leer_archivo_project): el carril "Projects" ya LEE archivos reales de cada Project con este
+// scope. La escritura (crear/editar/compartir) sigue sin implementar — necesita `drive.file`, que
+// Mariano va a autorizar en una reautorización aparte (semana del 22/09/2026), no se adelanta acá
+// sin el scope real en mano. Proyecto en modo "Testing" con un solo usuario (Mariano): agregar un
+// scope nuevo no dispara verificación de Google ni tiene costo, pero sí exige que Mariano vuelva a
+// pasar por la pantalla de consentimiento la próxima vez que reautorice.
 const GOOGLE_OAUTH_SCOPES = [
   'https://www.googleapis.com/auth/gmail.send',
   'https://www.googleapis.com/auth/gmail.modify',
@@ -194,6 +194,7 @@ async function completeOAuthCallback(code) {
 const gmailClient = google.gmail({ version: 'v1', auth: googleOAuthClient });
 const calendarClient = google.calendar({ version: 'v3', auth: googleOAuthClient });
 const tasksClient = google.tasks({ version: 'v1', auth: googleOAuthClient });
+const driveClient = google.drive({ version: 'v3', auth: googleOAuthClient });
 
 // true mientras el token esté marcado como vencido — evita seguir reintentando llamadas que
 // sabemos que van a fallar hasta que Mariano reautorice.
@@ -264,6 +265,105 @@ async function callGoogleAPI(userId, fn) {
 }
 
 // ─────────────────────────────────────────
+// CARRIL "PROJECT" — buzón Drive por carpeta (ítem 146, implementación real 22/09/2026)
+// ─────────────────────────────────────────
+// folderId reales de Drive, verificados uno por uno contra la cuenta que autoriza el Bot
+// (oliveramoa@gmail.com) ANTES de cargarlos acá — nunca inventados (ver diagnóstico de la sesión
+// del 21-22/09/2026). `sensible:true` fuerza que callAIForProject() use EXCLUSIVAMENTE Groq para
+// ese proyecto, sin fallback a ninguna otra capa — restricción nueva y distinta del fallback
+// general de 4 capas del Bot (ítem 174), no toca ni relaja ese otro fallback.
+// Dr. Laboral/Dr. House/Dr. Marketing (22/09/2026): los 3 folderId que pasó Mariano al principio
+// eran el mismo id repetido por error (copy-paste) — resultó ser la carpeta PADRE "Claude Cowork"
+// (contiene a TODOS los proyectos, incluidos los otros sensibles), no una carpeta individual.
+// Frenado antes de cargarlo (hubiera expuesto Dr. Civil/Dr. Penal/Bróker bajo la etiqueta "Dr.
+// Laboral"). Se listaron los hijos reales de esa carpeta padre, se encontraron los 3 por nombre
+// exacto, y Mariano confirmó explícitamente que son los correctos antes de cargarlos.
+const PROJECT_FOLDERS = {
+  'metatrón': { folderId: '17hWqPo_Bm3vTdS4TltT19iDGoiX-OkvV', sensible: false, label: 'Metatrón Cowork' },
+  'broker': { folderId: '1mQgqW9tl68AMxECdz1IWLGhgry_6Vr2K', sensible: true, label: 'Dr. Broker' },
+  'dr. apps': { folderId: '1UD7sNNOb8ncQ1glD5pX9xAcpppHtlLxV', sensible: false, label: 'App 001 - CifradoFloat' },
+  'dr. civil': { folderId: '1UO3k4t-7sh4SOVWn6b3KZd-m8OvxdaYX', sensible: true, label: 'Dr. Civil Cowork' },
+  'dr. penal': { folderId: '18OA9T5EZJDpdIdSAP4A8y60vY8Qg_8MC', sensible: true, label: 'Dr. Penal Cowork' },
+  'dr. laboral': { folderId: '1OM4R-GEVvSyhyXDw7o4zNaGbvjcTP43g', sensible: true, label: 'Dr. Laboral Cowork' },
+  'dr. house': { folderId: '1XKdOJ41Fq7koHRPev2Xtbt_kbFBVkdl-', sensible: false, label: 'Dr. House Cowork' },
+  'dr. marketing': { folderId: '1XEKx8fB3gyCiayONLqmvbBjApSruzfwI', sensible: false, label: 'Dr. Marketing Cowork' },
+};
+
+// Match flexible por substring en ambos sentidos ("bróker"/"broker"/"dr. broker" deben resolver a
+// la misma key) — sin acentos para no depender de que el usuario tipee la tilde bien.
+function normalizeProjectText(s) {
+  return (s || '').toLowerCase().normalize('NFD').replace(/[̀-ͯ]/g, '').trim();
+}
+
+function resolveProjectKey(nombre) {
+  const t = normalizeProjectText(nombre);
+  if (!t) return null;
+  return Object.keys(PROJECT_FOLDERS).find((k) => {
+    const kn = normalizeProjectText(k);
+    return t.includes(kn) || kn.includes(t) || t.includes(normalizeProjectText(PROJECT_FOLDERS[k].label));
+  }) || null;
+}
+
+function isProjectSensible(projectKey) {
+  return !!PROJECT_FOLDERS[projectKey]?.sensible;
+}
+
+function listaProjectsDisponibles() {
+  return Object.values(PROJECT_FOLDERS).map((p) => `${p.label}${p.sensible ? ' (sensible)' : ''}`).join(', ');
+}
+
+const PROJECT_MIME_LABELS = {
+  'application/vnd.google-apps.document': 'Google Doc',
+  'application/vnd.google-apps.spreadsheet': 'Google Sheet',
+  'application/vnd.google-apps.presentation': 'Google Slides',
+  'application/vnd.google-apps.folder': 'carpeta',
+  'application/pdf': 'PDF',
+  'application/vnd.openxmlformats-officedocument.wordprocessingml.document': 'Word',
+  'text/plain': 'texto plano',
+};
+function mimeTypeLabel(mimeType) {
+  return PROJECT_MIME_LABELS[mimeType] || mimeType;
+}
+
+// Lee un archivo de Drive como texto plano sea cual sea su formato. Reusa extractPdfText()/
+// extractDocxText() (ya existentes para documentos subidos por Telegram, ver sección DOCUMENTOS más
+// abajo — function declarations, hoisted, se pueden referenciar acá arriba sin problema) en vez de
+// duplicar la extracción. Devuelve el mismo shape {ok,data}/{ok:false,expired,error} que
+// callGoogleAPI, para que los handlers de las tools puedan tratarlos igual.
+async function readProjectFileContent(userId, fileId, mimeType, fileName) {
+  if (/^(image|video|audio)\//.test(mimeType)) {
+    return { ok: false, expired: false, error: `"${fileName}" es ${mimeTypeLabel(mimeType)} — todavía no hay soporte de lectura para ese tipo de archivo.` };
+  }
+  if (mimeType === 'application/vnd.google-apps.spreadsheet' || mimeType === 'application/vnd.google-apps.presentation') {
+    return { ok: false, expired: false, error: `"${fileName}" es ${mimeTypeLabel(mimeType)} — todavía no soportado para lectura (solo Google Docs, PDF, Word y texto plano por ahora).` };
+  }
+  if (mimeType === 'application/vnd.google-apps.document') {
+    const result = await callGoogleAPI(userId, () =>
+      driveClient.files.export({ fileId, mimeType: 'text/plain' }, { responseType: 'text' })
+    );
+    return result.ok ? { ok: true, data: result.data.data } : result;
+  }
+  if (mimeType === 'application/pdf' || mimeType === 'application/vnd.openxmlformats-officedocument.wordprocessingml.document') {
+    const result = await callGoogleAPI(userId, () =>
+      driveClient.files.get({ fileId, alt: 'media' }, { responseType: 'arraybuffer' })
+    );
+    if (!result.ok) return result;
+    try {
+      const buffer = Buffer.from(result.data.data);
+      const text = mimeType === 'application/pdf' ? await extractPdfText(buffer) : await extractDocxText(buffer);
+      return { ok: true, data: text };
+    } catch (error) {
+      return { ok: false, expired: false, error: `No pude extraer texto de "${fileName}": ${error.message}` };
+    }
+  }
+  // Texto plano / markdown / csv / etc. — mejor esfuerzo genérico.
+  const result = await callGoogleAPI(userId, () =>
+    driveClient.files.get({ fileId, alt: 'media' }, { responseType: 'text' })
+  );
+  return result.ok ? { ok: true, data: result.data.data } : result;
+}
+
+// ─────────────────────────────────────────
 // CONFIGURACIÓN DEL BOT (guardada en Firebase)
 // ─────────────────────────────────────────
 async function getConfig(userId) {
@@ -294,6 +394,37 @@ async function logAccion({ accion, destinatario_o_archivo, confirmada, resultado
   } catch (error) {
     console.error('Error escribiendo en log_acciones:', error.message);
   }
+}
+
+// ─────────────────────────────────────────
+// COLA DE PEDIDOS — tareas_hermes (esquema compartido, 22/09/2026)
+// ─────────────────────────────────────────
+// Un solo escritor para la colección `tareas_hermes`, reusado por derivar_tarea_hermes (carril PC
+// local) y derivar_tarea_project (carril Project/Drive) — evita que las dos tools escriban el
+// mismo esquema por separado y se desalineen con el tiempo. `origen:'bot'` y `project_destino`
+// (folderId de Drive si el pedido está atado a un Project con carpeta confirmada, o el string crudo
+// si no) permiten filtrar por origen y por proyecto. Esto es preparación de esquema para Hermes,
+// que todavía no está instalado — no activa ni simula ningún procesamiento real.
+async function encolarPedido({ titulo, instruccion, contexto, criterio_exito, entregable_tipo, entregable_destino, proyecto, prioridad, project_destino }) {
+  const doc = {
+    esquema: 1,
+    estado: 'pendiente',
+    titulo,
+    instruccion,
+    contexto: contexto || '',
+    criterio_exito,
+    entregable: { tipo: entregable_tipo || 'texto', destino: entregable_destino },
+    proyecto: proyecto || 'general',
+    prioridad: prioridad || 2,
+    creada: new Date().toISOString(),
+    creada_por: 'bot',
+    actualizada: new Date().toISOString(),
+    intentos: 0,
+    resultado: null,
+    origen: 'bot',
+    project_destino: project_destino || null,
+  };
+  return db.collection('tareas_hermes').add(doc);
 }
 
 async function getConfiguracionBot() {
@@ -1443,14 +1574,50 @@ const TOOL_DEFS = [
     type: 'function',
     function: {
       name: 'derivar_tarea_project',
-      description: 'Deriva un pedido al carril de un Project específico (Dr. Civil, Bróker, etc.) cuando necesita el contexto o los archivos de ese Project — ej. un dictamen jurídico, una propuesta de negocio.',
+      description: 'Deja un pedido en la cola (para Cowork y, a futuro, Hermes) destinado al carril de un Project específico (Dr. Civil, Bróker, etc.) — ej. "armame un dictamen sobre este caso", "necesito una propuesta para Bróker". NUNCA llames esta herramienta sin tener instruccion, criterio_exito y entregable ya confirmados con Mariano en el chat — si falta ese cierre, preguntá primero. Todavía no hay un agente (Hermes) procesando la cola automáticamente — el pedido queda guardado para cuando esté instalado.',
       parameters: {
         type: 'object',
         properties: {
-          proyecto: { type: 'string', description: 'Nombre del Project, ej. "Dr. Civil", "Bróker".' },
+          proyecto: { type: 'string', description: 'Nombre del Project, ej. "Dr. Civil", "Bróker", "Metatrón". Tiene que ser uno con carpeta de Drive confirmada.' },
           titulo: { type: 'string' },
+          instruccion: { type: 'string', description: 'Imperativa y autocontenida — quien procese el pedido no ve el chat original.' },
+          contexto: { type: 'string', description: 'Solo datos: nombres, fechas, valores.' },
+          criterio_exito: { type: 'string' },
+          entregable_tipo: { type: 'string', enum: ['archivo', 'texto', 'accion'] },
+          entregable_destino: { type: 'string' },
+          prioridad: { type: 'number', description: '1 urgente, 2 normal, 3 cuando puedas.' },
         },
-        required: ['proyecto', 'titulo'],
+        required: ['proyecto', 'titulo', 'instruccion', 'criterio_exito', 'entregable_tipo', 'entregable_destino'],
+      },
+    },
+  },
+  {
+    type: 'function',
+    function: {
+      name: 'listar_archivos_project',
+      description: 'Lista los archivos de la carpeta de Drive de un Project (nombre, tipo, fecha de modificación). Solo lectura — no crea ni modifica nada. Usala cuando Mariano pida ver qué hay en la carpeta de un Project, ej. "qué archivos tiene Dr. Civil", "mostrame la carpeta de Bróker".',
+      parameters: {
+        type: 'object',
+        properties: {
+          proyecto: { type: 'string', description: 'Nombre del Project, ej. "Dr. Civil", "Bróker", "Metatrón".' },
+        },
+        required: ['proyecto'],
+      },
+    },
+  },
+  {
+    type: 'function',
+    function: {
+      name: 'leer_archivo_project',
+      description: 'Lee un archivo existente en la carpeta de Drive de un Project y lo procesa con IA según la instrucción de Mariano (resumir, extraer datos, responder una pregunta sobre el contenido, etc.). Para Projects sensibles (Dr. Civil, Dr. Penal, Bróker) usa EXCLUSIVAMENTE Groq — si Groq no responde, la operación se aborta sin caer a ningún otro proveedor, nunca se procesa contenido sensible con otro modelo. Si no tenés el nombre exacto del archivo, llamá primero a listar_archivos_project.',
+      parameters: {
+        type: 'object',
+        properties: {
+          proyecto: { type: 'string', description: 'Nombre del Project.' },
+          archivo: { type: 'string', description: 'Nombre (exacto o parcial) del archivo dentro de esa carpeta.' },
+          instruccion: { type: 'string', description: 'Qué hacer con el contenido — ej. "resumí los puntos clave", "extraé las fechas mencionadas".' },
+        },
+        required: ['proyecto', 'archivo', 'instruccion'],
       },
     },
   },
@@ -1767,35 +1934,110 @@ const TOOL_HANDLERS = {
   },
 
   // El carril "Project" (buzón Drive por carpeta) tiene desde el ítem 146 (29/08/2026) el scope
-  // drive.readonly autorizado (GOOGLE_OAUTH_SCOPES), pero eso solo es el permiso — todavía no hay
-  // ningún cliente de Drive API ni lógica de lectura/escritura de archivos conectada en este código
-  // (eso sigue siendo H2/H3 según el .md base). Se deja el tool para que el modelo reconozca el
-  // pedido y avise la limitación real en vez de fingir que lo hizo (Lección Gordon).
-  derivar_tarea_project: async ({ proyecto, titulo }) => {
-    return `No puedo derivar todavía al carril de Project ("${proyecto}: ${titulo}") — el scope de Google Drive ya está autorizado, pero la integración real (leer/escribir en el buzón de Drive de los Projects) todavía no está implementada en el código, queda para un hito posterior (H2/H3). Es una limitación real, no un error.`;
+  // drive.readonly autorizado — implementado de verdad el 22/09/2026: inventario y lectura+
+  // procesamiento (ver listar_archivos_project/leer_archivo_project más abajo) ya funcionan.
+  // La escritura (crear/derivar archivos nuevos en Drive) sigue en pausa — necesita el scope
+  // drive.file, todavía no autorizado por Mariano (ver handoff). Por eso este tool sigue sin tocar
+  // Drive: solo encola el pedido en tareas_hermes para cuando haya un agente (Hermes) que lo
+  // ejecute — comparte la misma escritura que derivar_tarea_hermes (encolarPedido()), con
+  // project_destino resuelto contra PROJECT_FOLDERS.
+  derivar_tarea_project: async ({ proyecto, titulo, instruccion, contexto, criterio_exito, entregable_tipo, entregable_destino, prioridad }) => {
+    const projectKey = resolveProjectKey(proyecto);
+    if (!projectKey) {
+      return `No reconozco "${proyecto}" como un Project con carpeta de Drive confirmada. Los disponibles hoy son: ${listaProjectsDisponibles()}. Si es un Project nuevo, avisale a Mariano que hace falta el folderId real de Drive antes de poder derivarle pedidos.`;
+    }
+    if (!instruccion || !criterio_exito || !entregable_destino) {
+      return 'Falta instruccion, criterio_exito y/o entregable confirmados con Mariano — preguntale antes de derivar, no se creó el pedido.';
+    }
+    const folder = PROJECT_FOLDERS[projectKey];
+    const ref = await encolarPedido({
+      titulo, instruccion, contexto, criterio_exito, entregable_tipo, entregable_destino, prioridad,
+      proyecto: folder.label,
+      project_destino: folder.folderId,
+    });
+    await logAccion({ accion: 'derivar_tarea_project', destinatario_o_archivo: ref.id, confirmada: true, resultado: `creada: ${titulo} → ${folder.label}` });
+    return `Pedido derivado al carril de "${folder.label}" (id ${ref.id}): "${titulo}". Todavía no hay un agente (Hermes) procesando la cola automáticamente — queda guardado para cuando esté instalado.`;
+  },
+
+  listar_archivos_project: async ({ proyecto }, ctx) => {
+    const projectKey = resolveProjectKey(proyecto);
+    if (!projectKey) {
+      return `No reconozco "${proyecto}" como un Project con carpeta de Drive confirmada. Los disponibles hoy son: ${listaProjectsDisponibles()}.`;
+    }
+    const folder = PROJECT_FOLDERS[projectKey];
+    const result = await callGoogleAPI(ctx.from.id, () =>
+      driveClient.files.list({
+        q: `'${folder.folderId}' in parents and trashed=false`,
+        fields: 'files(id,name,mimeType,modifiedTime)',
+        orderBy: 'modifiedTime desc',
+        pageSize: 50,
+      })
+    );
+    if (!result.ok) {
+      return result.expired
+        ? 'El token de Drive está vencido, pendiente de reautorización de Mariano.'
+        : `No pude listar la carpeta de "${folder.label}": ${result.error}`;
+    }
+    const files = result.data.data.files || [];
+    if (!files.length) return `La carpeta de "${folder.label}" está vacía (o no tiene archivos visibles para el Bot).`;
+    const lineas = files.map((f) =>
+      `• ${f.name} (${mimeTypeLabel(f.mimeType)}) — modificado ${new Date(f.modifiedTime).toLocaleString('es-AR', { timeZone: 'America/Argentina/Buenos_Aires' })}`
+    );
+    return `Archivos en "${folder.label}":\n${lineas.join('\n')}`;
+  },
+
+  leer_archivo_project: async ({ proyecto, archivo, instruccion }, ctx) => {
+    const projectKey = resolveProjectKey(proyecto);
+    if (!projectKey) {
+      return `No reconozco "${proyecto}" como un Project con carpeta de Drive confirmada. Los disponibles hoy son: ${listaProjectsDisponibles()}.`;
+    }
+    const folder = PROJECT_FOLDERS[projectKey];
+    const nombreEscapadoQuery = String(archivo || '').replace(/\\/g, '\\\\').replace(/'/g, "\\'");
+    const listResult = await callGoogleAPI(ctx.from.id, () =>
+      driveClient.files.list({
+        q: `'${folder.folderId}' in parents and trashed=false and name contains '${nombreEscapadoQuery}'`,
+        fields: 'files(id,name,mimeType)',
+        pageSize: 10,
+      })
+    );
+    if (!listResult.ok) {
+      return listResult.expired
+        ? 'El token de Drive está vencido, pendiente de reautorización de Mariano.'
+        : `No pude buscar "${archivo}" en "${folder.label}": ${listResult.error}`;
+    }
+    const matches = listResult.data.data.files || [];
+    if (!matches.length) return `No encontré ningún archivo que coincida con "${archivo}" en "${folder.label}".`;
+    if (matches.length > 1) {
+      return `Encontré varios archivos que coinciden con "${archivo}" en "${folder.label}":\n${matches.map((f) => `• ${f.name}`).join('\n')}\nDecime el nombre exacto.`;
+    }
+    const file = matches[0];
+    const contentResult = await readProjectFileContent(ctx.from.id, file.id, file.mimeType, file.name);
+    if (!contentResult.ok) {
+      return contentResult.expired
+        ? 'El token de Drive está vencido, pendiente de reautorización de Mariano.'
+        : contentResult.error || `No pude leer "${file.name}".`;
+    }
+    const contenido = (contentResult.data || '').slice(0, 40000);
+    const aiResult = await callAIForProject(
+      projectKey,
+      'Sos un asistente que procesa un documento puntual de un Project. Respondé directo, en español rioplatense, sin inventar contenido que no esté en el documento.',
+      `Instrucción: ${instruccion}\n\nContenido del archivo "${file.name}":\n\n${contenido}`
+    );
+    if (!aiResult.ok) return aiResult.error;
+    await logAccion({ accion: 'leer_archivo_project', destinatario_o_archivo: `${folder.label}/${file.name}`, confirmada: true, resultado: `procesado con ${aiResult.provider}/${aiResult.model}` });
+    return aiResult.text;
   },
 
   derivar_tarea_hermes: async ({ titulo, instruccion, contexto, criterio_exito, entregable_tipo, entregable_destino, proyecto, prioridad }) => {
     if (!criterio_exito || !entregable_destino) {
       return 'Falta criterio_exito y/o entregable confirmados con Mariano — preguntale antes de derivar, no se creó la tarea.';
     }
-    const doc = {
-      esquema: 1,
-      estado: 'pendiente',
-      titulo,
-      instruccion,
-      contexto: contexto || '',
-      criterio_exito,
-      entregable: { tipo: entregable_tipo || 'texto', destino: entregable_destino },
+    const projectKey = resolveProjectKey(proyecto);
+    const ref = await encolarPedido({
+      titulo, instruccion, contexto, criterio_exito, entregable_tipo, entregable_destino, prioridad,
       proyecto: proyecto || 'general',
-      prioridad: prioridad || 2,
-      creada: new Date().toISOString(),
-      creada_por: 'bot',
-      actualizada: new Date().toISOString(),
-      intentos: 0,
-      resultado: null,
-    };
-    const ref = await db.collection('tareas_hermes').add(doc);
+      project_destino: projectKey ? PROJECT_FOLDERS[projectKey].folderId : (proyecto || null),
+    });
     await logAccion({ accion: 'derivar_tarea_hermes', destinatario_o_archivo: ref.id, confirmada: true, resultado: `creada: ${titulo}` });
     return `Tarea derivada a Hermes (id ${ref.id}): "${titulo}".`;
   },
@@ -2434,6 +2676,66 @@ async function callAI(messages, config, onToolNotice, userId, ctx) {
 
   await logAIFailure(userId, attempts);
   return 'Lo siento, no hay servicios de IA disponibles en este momento.';
+}
+
+// IA para el carril "Project" (lectura/procesamiento de archivos de Drive) — deliberadamente
+// SEPARADA de callAI(): es texto→texto sobre el contenido de un documento puntual, no una
+// conversación con acciones sobre Gmail/Calendar/Tasks, así que nunca manda TOOL_DEFS ni pasa por
+// chatWithTools() (mezclar ambas cosas dejaría que el modelo intente llamar herramientas no
+// relacionadas mientras solo se le pidió resumir un archivo). Para proyectos `sensible:true` (ver
+// PROJECT_FOLDERS) usa EXCLUSIVAMENTE Groq — si Groq no responde, aborta la operación entera y
+// avisa por Telegram, SIN caer a ninguna otra capa. Esto es una restricción nueva y distinta del
+// fallback general de 4 capas de callAI() (ítem 174) — no lo toca ni lo relaja.
+async function callAIForProject(projectKey, systemPrompt, userPrompt) {
+  const sensible = isProjectSensible(projectKey);
+  const messages = [{ role: 'system', content: systemPrompt }, { role: 'user', content: userPrompt }];
+  const cadena = sensible
+    ? [{ provider: 'groq', model: MODELS_BY_PROVIDER.groq.default }]
+    : [
+        { provider: 'groq', model: MODELS_BY_PROVIDER.groq.default },
+        { provider: 'google', model: MODELS_BY_PROVIDER.google.default },
+        { provider: 'cloudflare', model: MODELS_BY_PROVIDER.cloudflare.default },
+        { provider: 'openrouter', model: MODELS_BY_PROVIDER.openrouter.default },
+        { provider: 'openrouter', model: 'nvidia/nemotron-3-ultra-550b-a55b:free' },
+        { provider: 'openrouter', model: 'minimax/minimax-m3:free' },
+        { provider: 'openrouter', model: 'openrouter/free' },
+      ];
+
+  const attempts = [];
+  for (const { provider, model } of cadena) {
+    const { url, apiKey } = getProviderEndpoint(provider);
+    if (!url || !apiKey) continue;
+    try {
+      const response = await axios.post(
+        url,
+        { model, messages, temperature: 0.4 },
+        { headers: { 'Content-Type': 'application/json', Authorization: `Bearer ${apiKey}` }, timeout: 45000 }
+      );
+      return { ok: true, text: response.data.choices[0].message.content, provider, model };
+    } catch (error) {
+      const detail = error.response?.data?.error?.message || error.message;
+      console.error(`Error ${provider}/${model} procesando Project "${projectKey}":`, detail);
+      attempts.push({ provider, model, error: detail, reason: classifyAIError(error) });
+    }
+  }
+
+  await logAIFailure(`project:${projectKey}`, attempts);
+
+  if (sensible) {
+    const detail = attempts[0]?.error || 'GROQ_API_KEY no está configurada';
+    try {
+      await bot.telegram.sendMessage(
+        process.env.TELEGRAM_ALLOWED_USER_ID,
+        `⚠️ Groq (única capa permitida para "${escapeHtml(PROJECT_FOLDERS[projectKey]?.label || projectKey)}", proyecto sensible) no respondió — se abortó el procesamiento del archivo, sin caer a ninguna otra capa.\nError: ${escapeHtml(detail)}`,
+        { parse_mode: 'HTML' }
+      );
+    } catch (err) {
+      console.error('Error avisando abort de Project sensible:', err.message);
+    }
+    return { ok: false, error: `Groq (única capa permitida para proyectos sensibles) no respondió: ${detail}. Se abortó la operación — no se intentó ningún otro proveedor.` };
+  }
+
+  return { ok: false, error: 'Ninguna de las 4 capas de IA respondió en este momento.' };
 }
 
 // ─────────────────────────────────────────
@@ -3338,7 +3640,7 @@ async function buildDailyBrief(userId) {
     `📋 <b>Aviso diario — ${escapeHtml(getArgentinaDateTime())}</b>\n\n` +
     `<b>Bot (ayer):</b>\n${resumenAcciones}\n\n` +
     `<b>Hermes:</b>\n${escapeHtml(hermesTexto)}\n\n` +
-    `<b>Projects:</b>\nno disponible todavía (scope de Drive ya autorizado desde el ítem 146, pero la integración de lectura/escritura sigue sin implementar — H2/H3).\n\n` +
+    `<b>Projects:</b>\nlectura/inventario de Drive disponible (${Object.keys(PROJECT_FOLDERS).length} de 8 Projects con carpeta confirmada). Escritura pendiente del scope drive.file.\n\n` +
     `<b>Calendar hoy:</b>\n${calendarTexto}\n\n` +
     `<b>Token Gmail/Calendar/Tasks:</b> ${googleOAuthExpired ? '⚠️ vencido, pendiente de reautorización.' : 'OK.'}\n\n` +
     `<b>Modelos (catálogo A3):</b> ${modelosTexto}`
